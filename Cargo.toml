@@ -2,6 +2,8 @@
 name = "skinvas"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Minecraft skin editor for Linux: 2D/3D painting, 3D skin layers, totem resource packs, skin browser"
 
 [dependencies]
 adw = { version = "0.9.2", package = "libadwaita", features = ["v1_6"] }
