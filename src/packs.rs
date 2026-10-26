@@ -390,18 +390,21 @@ pub fn build_zip(img: &RgbaImage, slim: bool, o: &Opts) -> Vec<u8> {
 
 /// resourcepacks folders of installed launchers (only ones that exist).
 pub fn launcher_dirs() -> Vec<(String, PathBuf)> {
-    let home = gtk::glib::home_dir();
+    let home = crate::tools::launcher_base();
     let mut out = vec![];
     let mc = home.join(".minecraft/resourcepacks");
     if mc.parent().is_some_and(|p| p.is_dir()) {
-        out.push(("Minecraft / TLauncher (~/.minecraft)".into(), mc));
+        out.push(("Minecraft / TLauncher (.minecraft)".into(), mc));
     }
+    #[cfg(unix)]
     let roots = [
         ("Prism", ".local/share/PrismLauncher/instances"),
         ("Prism (Flatpak)", ".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/instances"),
         ("MultiMC", ".local/share/multimc/instances"),
         ("Modrinth", ".local/share/ModrinthApp/profiles"),
     ];
+    #[cfg(windows)]
+    let roots = [("Prism", "PrismLauncher/instances"), ("Modrinth", "ModrinthApp/profiles")];
     for (label, rel) in roots {
         let Ok(rd) = std::fs::read_dir(home.join(rel)) else { continue };
         let mut found: Vec<_> = rd.flatten().filter(|e| e.path().is_dir()).collect();

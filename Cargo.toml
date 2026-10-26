@@ -10,7 +10,7 @@ adw = { version = "0.9.2", package = "libadwaita", features = ["v1_6"] }
 base64 = "0.23.1"
 gtk = { version = "0.11.5", package = "gtk4", features = ["v4_12"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "gif"] }
-mlua = { version = "0.12.2", features = ["lua54"] }
+mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
 qrcode = { version = "0.14.1", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -26,3 +26,33 @@ opt-level = 2
 [profile.release]
 lto = "thin"
 strip = true
+
+[package.metadata.deb]
+maintainer = "mezyqq <207015145+mezyqq@users.noreply.github.com>"
+copyright = "2026, mezyqq"
+license-file = ["LICENSE", "0"]
+extended-description = "Paint Minecraft skins in 2D and right on the 3D model with voxel 3D layers, browse Ely.by and MineSkin, build totem resource packs and export GIF, OBJ, STL and Bedrock packs."
+section = "graphics"
+priority = "optional"
+# GTK/libadwaita minimums come from the gtk4 v4_12 and libadwaita v1_6 bindings we enable.
+depends = "libc6 (>= 2.34), libgtk-4-1 (>= 4.12), libadwaita-1-0 (>= 1.6)"
+assets = [
+    ["target/release/skinvas", "usr/bin/", "755"],
+    ["packaging/io.github.skinvas.desktop", "usr/share/applications/", "644"],
+    ["data/icons/hicolor/256x256/apps/io.github.skinvas.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Minecraft skin editor: 2D/3D painting, 3D skin layers, totem resource packs"
+auto-req = "no"
+assets = [
+    { source = "target/release/skinvas", dest = "/usr/bin/skinvas", mode = "755" },
+    { source = "packaging/io.github.skinvas.desktop", dest = "/usr/share/applications/io.github.skinvas.desktop", mode = "644" },
+    { source = "data/icons/hicolor/256x256/apps/io.github.skinvas.png", dest = "/usr/share/icons/hicolor/256x256/apps/io.github.skinvas.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/skinvas/LICENSE", doc = true, mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+glibc = ">= 2.34"
+gtk4 = ">= 4.12"
+libadwaita = ">= 1.6"

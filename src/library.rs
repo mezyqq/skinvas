@@ -108,11 +108,14 @@ impl Account {
 
     pub fn save(&self) -> Result<(), String> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
         let p = account_path();
         std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-        // The token is a credential: owner-only permissions.
-        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p).map_err(|e| e.to_string())?;
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        // The token is a credential: owner-only permissions (Windows profiles are per-user already).
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        let mut f = o.open(&p).map_err(|e| e.to_string())?;
         f.write_all(&serde_json::to_vec(self).unwrap()).map_err(|e| e.to_string())
     }
 

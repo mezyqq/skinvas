@@ -2,7 +2,11 @@
 // Frames are [opcode u32 LE][length u32 LE][JSON]; opcode 0 = handshake, 1 = command.
 use serde_json::json;
 use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+type Conn = std::os::unix::net::UnixStream;
+// Discord on Windows listens on a named pipe, which opens like a file.
+#[cfg(windows)]
+type Conn = std::fs::File;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,6 +17,24 @@ pub struct Presence {
     pub state: String,
 }
 
+#[cfg(unix)]
+fn open(p: &std::path::Path) -> std::io::Result<Conn> {
+    let s = Conn::connect(p)?;
+    s.set_read_timeout(Some(Duration::from_secs(5)))?;
+    Ok(s)
+}
+
+#[cfg(windows)]
+fn open(p: &std::path::Path) -> std::io::Result<Conn> {
+    std::fs::OpenOptions::new().read(true).write(true).open(p)
+}
+
+#[cfg(windows)]
+fn sockets() -> Vec<std::path::PathBuf> {
+    (0..10).map(|i| format!(r"\\.\pipe\discord-ipc-{i}").into()).collect()
+}
+
+#[cfg(unix)]
 fn sockets() -> Vec<std::path::PathBuf> {
     let run = std::env::var("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| "/tmp".into());
     let mut v = vec![];
@@ -26,7 +48,7 @@ fn sockets() -> Vec<std::path::PathBuf> {
     v
 }
 
-fn frame(s: &mut UnixStream, op: u32, payload: &serde_json::Value) -> std::io::Result<()> {
+fn frame(s: &mut Conn, op: u32, payload: &serde_json::Value) -> std::io::Result<()> {
     let b = payload.to_string().into_bytes();
     let mut buf = Vec::with_capacity(8 + b.len());
     buf.extend(op.to_le_bytes());
@@ -41,10 +63,9 @@ fn frame(s: &mut UnixStream, op: u32, payload: &serde_json::Value) -> std::io::R
     s.read_exact(&mut rest)
 }
 
-fn connect(client_id: &str) -> Option<UnixStream> {
+fn connect(client_id: &str) -> Option<Conn> {
     for p in sockets() {
-        if let Ok(mut s) = UnixStream::connect(&p) {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+        if let Ok(mut s) = open(&p) {
             if frame(&mut s, 0, &json!({"v": 1, "client_id": client_id})).is_ok() {
                 return Some(s);
             }
@@ -53,7 +74,7 @@ fn connect(client_id: &str) -> Option<UnixStream> {
     None
 }
 
-fn set(s: &mut UnixStream, p: Option<&Presence>, start: u64) -> std::io::Result<()> {
+fn set(s: &mut Conn, p: Option<&Presence>, start: u64) -> std::io::Result<()> {
     let activity = p.map(|p| {
         json!({
             "details": p.details, "state": p.state,
@@ -69,7 +90,7 @@ pub fn start() -> Sender<Option<Presence>> {
     let (tx, rx): (Sender<Option<Presence>>, Receiver<Option<Presence>>) = channel();
     std::thread::spawn(move || {
         let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let (mut cur, mut sock, mut sock_id): (Option<Presence>, Option<UnixStream>, String) = (None, None, String::new());
+        let (mut cur, mut sock, mut sock_id): (Option<Presence>, Option<Conn>, String) = (None, None, String::new());
         loop {
             match rx.recv_timeout(Duration::from_secs(15)) {
                 Ok(p) => cur = p,

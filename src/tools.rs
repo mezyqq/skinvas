@@ -588,9 +588,18 @@ pub fn mcpack(img: &RgbaImage, slim: bool, name: &str) -> Vec<u8> {
 }
 
 /// Folders where Minecraft and launchers cache every skin they have downloaded.
+/// Where launchers live: the home folder on Linux, %APPDATA% on Windows.
+pub fn launcher_base() -> std::path::PathBuf {
+    #[cfg(windows)]
+    if let Some(a) = std::env::var_os("APPDATA") {
+        return a.into();
+    }
+    gtk::glib::home_dir()
+}
+
 pub fn skin_caches() -> Vec<std::path::PathBuf> {
-    let h = gtk::glib::home_dir();
-    [".minecraft/assets/skins", ".local/share/PrismLauncher/assets/skins", ".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/assets/skins", ".local/share/multimc/assets/skins", ".local/share/ModrinthApp/meta/assets/skins", ".tlauncher/legacy/Minecraft/game/assets/skins"]
+    let h = launcher_base();
+    [".minecraft/assets/skins", "PrismLauncher/assets/skins", ".local/share/PrismLauncher/assets/skins", ".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher/assets/skins", ".local/share/multimc/assets/skins", ".local/share/ModrinthApp/meta/assets/skins", ".tlauncher/legacy/Minecraft/game/assets/skins"]
         .iter()
         .map(|p| h.join(p))
         .filter(|p| p.is_dir())
