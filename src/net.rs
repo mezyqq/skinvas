@@ -144,10 +144,30 @@ pub fn search(src: Source, query: &str, cursor: &str) -> Result<(Vec<Found>, Opt
 
 /// Current skin of a player by nickname.
 pub fn nick(src: Source, name: &str) -> Result<Option<Found>, String> {
+    let Some(v) = textures(src, name)? else { return Ok(None) };
+    let skin = &v["SKIN"];
+    Ok(skin["url"].as_str().map(|u| Found { name: name.to_string(), url: u.replace("http://", "https://"), slim: Some(skin["metadata"]["model"] == "slim") }))
+}
+
+/// Cape PNG of a player: 0 Mojang, 1 Ely.by, 2 OptiFine. Ok(None) = the player has none.
+pub fn cape(src: u32, name: &str) -> Result<Option<Vec<u8>>, String> {
+    if src == 2 {
+        // OptiFine answers 404 for players without a cape; its cape server is plain HTTP.
+        return Ok(get(&format!("http://s.optifine.net/capes/{}.png", urlencode(name))).ok());
+    }
+    let v = textures(if src == 1 { Source::ElyNick } else { Source::Mojang }, name)?;
+    match v.as_ref().and_then(|v| v["CAPE"]["url"].as_str()) {
+        Some(u) => image(&u.replace("http://", "https://")).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The "textures" object (SKIN, CAPE) of a player on Mojang or Ely.by.
+fn textures(src: Source, name: &str) -> Result<Option<Value>, String> {
     if name.is_empty() {
         return Ok(None);
     }
-    let v = if src == Source::ElyNick {
+    Ok(Some(if src == Source::ElyNick {
         json(&format!("https://skinsystem.ely.by/textures/{}", urlencode(name)))?
     } else {
         let Ok(p) = json(&format!("https://api.mojang.com/users/profiles/minecraft/{}", urlencode(name))) else { return Ok(None) };
@@ -156,9 +176,7 @@ pub fn nick(src: Source, name: &str) -> Result<Option<Found>, String> {
         let b64 = prof["properties"].as_array().and_then(|a| a.iter().find(|p| p["name"] == "textures")).and_then(|p| p["value"].as_str()).unwrap_or("");
         let raw = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string())?;
         serde_json::from_slice::<Value>(&raw).map_err(|e| e.to_string())?["textures"].clone()
-    };
-    let skin = &v["SKIN"];
-    Ok(skin["url"].as_str().map(|u| Found { name: name.to_string(), url: u.replace("http://", "https://"), slim: Some(skin["metadata"]["model"] == "slim") }))
+    }))
 }
 
 pub fn urlencode(s: &str) -> String {

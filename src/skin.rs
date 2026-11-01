@@ -92,6 +92,41 @@ pub fn face_info(slim: bool, x: u32, y: u32) -> Option<(usize, bool, usize, u32,
     None
 }
 
+/// Texture scale: 1 for 64x64 skins, 2 for 128x128 HD ones (64x32 capes count as 1).
+pub fn scale(img: &RgbaImage) -> u32 {
+    (img.width() / 64).max(1)
+}
+
+/// `face_at` for a texture scaled by `k` (HD skins use the same layout, k times bigger).
+pub fn face_at_k(slim: bool, k: u32, x: u32, y: u32) -> Option<(usize, bool, [u32; 4])> {
+    face_at(slim, x / k, y / k).map(|(i, ov, r)| (i, ov, r.map(|v| v * k)))
+}
+
+/// Face rects of a cape texture (64x32 layout): the cape box, then the elytra wing box.
+pub fn cape_faces() -> Vec<[u32; 4]> {
+    let z = [0.; 3];
+    box_faces(z, z, [0, 0], [10, 16, 1]).iter().chain(&box_faces(z, z, [22, 0], [10, 20, 2])).map(|f| f.rect).collect()
+}
+
+/// Cape PNG -> 64x32 layout (or a multiple for HD). OptiFine's 46x22 capes are the same layout, cropped.
+pub fn load_cape(bytes: &[u8]) -> Result<RgbaImage, String> {
+    let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let k = match (w, h) {
+        _ if w % 64 == 0 && w == h * 2 => w / 64,
+        _ if w % 46 == 0 && w * 22 == h * 46 => w / 46,
+        _ => return Err(format!("{w}x{h}")),
+    };
+    let mut out = RgbaImage::new(64 * k, 32 * k);
+    image::imageops::replace(&mut out, &img, 0, 0);
+    Ok(out)
+}
+
+/// Resized copy (nearest neighbour) for things that only take one size, e.g. 64x64 packs from an HD skin.
+pub fn fit(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    if img.dimensions() == (w, h) { img.clone() } else { image::imageops::resize(img, w, h, image::imageops::FilterType::Nearest) }
+}
+
 /// Base texel -> matching overlay texel of the same part.
 pub fn to_overlay(slim: bool, x: u32, y: u32) -> (u32, u32) {
     match face_at(slim, x, y) {
@@ -103,11 +138,11 @@ pub fn to_overlay(slim: bool, x: u32, y: u32) -> (u32, u32) {
     }
 }
 
-/// Load any PNG skin; legacy 64x32 skins are converted to 64x64.
+/// Load any PNG skin; legacy 64x32 skins are converted to 64x64. HD: 128x128 and 256x256.
 pub fn load(bytes: &[u8]) -> Result<RgbaImage, String> {
     let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.to_rgba8();
     match img.dimensions() {
-        (64, 64) => Ok(img),
+        (64 | 128 | 256, h) if h == img.width() => Ok(img),
         (64, 32) => Ok(upgrade_legacy(&img)),
         (w, h) => Err(format!("{w}x{h}")),
     }
@@ -115,7 +150,8 @@ pub fn load(bytes: &[u8]) -> Result<RgbaImage, String> {
 
 pub fn detect_slim(img: &RgbaImage) -> bool {
     // Classic arms use column 54..56 of the right arm back face; slim leaves it empty.
-    (20..32).all(|y| img.get_pixel(55, y)[3] == 0)
+    let k = scale(img);
+    (20 * k..32 * k).all(|y| img.get_pixel_checked(55 * k, y).is_none_or(|p| p[3] == 0))
 }
 
 fn upgrade_legacy(old: &RgbaImage) -> RgbaImage {
@@ -239,5 +275,22 @@ mod tests {
         assert_eq!(img.dimensions(), (64, 64));
         assert_eq!(img.get_pixel(23, 52)[0], 255); // mirrored onto left leg front, rightmost column
         assert!(!detect_slim(&default_skin()));
+        let hd = fit(&default_skin(), 128, 128);
+        assert!(!detect_slim(&hd) && load(&png(&hd)).is_ok());
+        assert_eq!(face_at_k(false, 2, 17, 17).map(|f| f.2), Some([16, 16, 16, 16])); // head front, HD
+    }
+
+    fn png(img: &RgbaImage) -> Vec<u8> {
+        let mut b = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut b, image::ImageFormat::Png).unwrap();
+        b.into_inner()
+    }
+
+    #[test]
+    fn capes_load_from_mojang_and_optifine_sizes() {
+        assert_eq!(load_cape(&png(&RgbaImage::new(64, 32))).unwrap().dimensions(), (64, 32));
+        assert_eq!(load_cape(&png(&RgbaImage::new(92, 44))).unwrap().dimensions(), (128, 64));
+        assert!(load_cape(&png(&RgbaImage::new(64, 64))).is_err());
+        assert_eq!(cape_faces()[1], [1, 1, 10, 16]); // cape outside
     }
 }

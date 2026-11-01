@@ -199,8 +199,12 @@ impl AppCtx {
                 let mut s = self.st.borrow_mut();
                 s.mark_saved(path.to_path_buf());
                 s.emote(0);
+                // Recent files reopen as skins, and a 64x32 cape would load as an old-format skin.
+                let cape = s.cape_doc;
                 drop(s);
-                self.remember(path);
+                if !cape {
+                    self.remember(path);
+                }
                 self.toast(t("saved"));
             }
             Err(e) => self.toast(&format!("{}: {e}", t("error"))),

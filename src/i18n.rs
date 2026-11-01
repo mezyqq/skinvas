@@ -46,7 +46,7 @@ const T: &[[&str; 5]] = &[
     ["cancel", "Отмена", "Cancel", "Скасувати", "Anuluj"],
     ["saved", "Сохранено", "Saved", "Збережено", "Zapisano"],
     ["error", "Ошибка", "Error", "Помилка", "Błąd"],
-    ["bad_size", "Скин должен быть 64×64 или 64×32, а этот", "A skin must be 64×64 or 64×32, this one is", "Скін має бути 64×64 або 64×32, а цей", "Skin musi mieć 64×64 lub 64×32, a ten ma"],
+    ["bad_size", "Скин должен быть 64×64, 64×32 или HD 128×128, а этот", "A skin must be 64×64, 64×32 or HD 128×128, this one is", "Скін має бути 64×64, 64×32 або HD 128×128, а цей", "Skin musi mieć 64×64, 64×32 lub HD 128×128, a ten ma"],
     ["png", "Скины PNG", "PNG skins", "Скіни PNG", "Skiny PNG"],
     ["untitled", "Без имени", "Untitled", "Без назви", "Bez nazwy"],
     ["drop", "Отпустите PNG, чтобы открыть", "Drop a PNG to open it", "Відпустіть PNG, щоб відкрити", "Upuść PNG, aby otworzyć"],
@@ -337,6 +337,67 @@ const T: &[[&str; 5]] = &[
     ["export_stl_tip", "С объёмным вторым слоем; число — высота в миллиметрах", "With the voxel outer layer; the number is the height in mm", "З об'ємним другим шаром; число — висота в міліметрах", "Z wokselową drugą warstwą; liczba to wysokość w mm"],
     ["height_mm", "Высота, мм", "Height, mm", "Висота, мм", "Wysokość, mm"],
     ["src_local", "С компьютера (кэш Minecraft и лаунчеров)", "This computer (Minecraft & launcher cache)", "З комп'ютера (кеш Minecraft і лаунчерів)", "Z komputera (pamięć Minecrafta i launcherów)"],
+    ["layers", "Слои", "Layers", "Шари", "Warstwy"],
+    ["layer", "Слой", "Layer", "Шар", "Warstwa"],
+    ["layer_add", "Новый слой", "New layer", "Новий шар", "Nowa warstwa"],
+    ["layer_del", "Удалить слой", "Delete layer", "Видалити шар", "Usuń warstwę"],
+    ["layer_up", "Выше", "Move up", "Вище", "W górę"],
+    ["layer_down", "Ниже", "Move down", "Нижче", "W dół"],
+    ["layer_merge", "Слить с нижним", "Merge down", "Злити з нижнім", "Scal w dół"],
+    ["layers_tip", "Галочка — видимость. При сохранении слои сливаются в один PNG.", "The tick shows or hides a layer. Saving merges the layers into one PNG.", "Галочка — видимість. Під час збереження шари зливаються в один PNG.", "Ptaszek pokazuje lub ukrywa warstwę. Zapis scala warstwy w jeden PNG."],
+    ["stamp_tool", "Наклейка: клик ставит выбранную деталь", "Sticker: click places the chosen detail", "Наліпка: клік ставить вибрану деталь", "Naklejka: kliknięcie wstawia wybrany detal"],
+    ["stickers", "Наклейки", "Stickers", "Наліпки", "Naklejki"],
+    ["st_eyes", "Глаза", "Eyes", "Очі", "Oczy"],
+    ["st_eyes_big", "Большие глаза", "Big eyes", "Великі очі", "Duże oczy"],
+    ["st_brows", "Хмурые брови", "Frown", "Насуплені брови", "Zmarszczone brwi"],
+    ["st_smile", "Улыбка", "Smile", "Усмішка", "Uśmiech"],
+    ["st_blush", "Румянец", "Blush", "Рум'янець", "Rumieńce"],
+    ["st_beard", "Борода", "Beard", "Борода", "Broda"],
+    ["st_shades", "Очки", "Sunglasses", "Окуляри", "Okulary"],
+    ["st_belt", "Ремень", "Belt", "Пасок", "Pasek"],
+    ["st_buttons", "Пуговицы", "Buttons", "Ґудзики", "Guziki"],
+    ["st_heart", "Сердце", "Heart", "Серце", "Serce"],
+    ["st_star", "Звезда", "Star", "Зірка", "Gwiazda"],
+    ["st_tie", "Галстук", "Tie", "Краватка", "Krawat"],
+    ["palettes", "Палитры", "Palettes", "Палітри", "Palety"],
+    ["palette_import", "Импорт палитры (.gpl, .hex)…", "Import palette (.gpl, .hex)…", "Імпорт палітри (.gpl, .hex)…", "Importuj paletę (.gpl, .hex)…"],
+    ["palette_reset", "Палитра красителей", "Dye palette", "Палітра барвників", "Paleta barwników"],
+    ["palette_lock", "Рисовать только цветами палитры", "Paint with palette colours only", "Малювати лише кольорами палітри", "Maluj tylko kolorami palety"],
+    ["palette_bad", "В файле нет цветов", "No colours in this file", "У файлі немає кольорів", "Brak kolorów w pliku"],
+    ["hd_toggle", "HD 128×128 ⇄ 64×64", "HD 128×128 ⇄ 64×64", "HD 128×128 ⇄ 64×64", "HD 128×128 ⇄ 64×64"],
+    ["cape", "Плащ", "Cape", "Плащ", "Peleryna"],
+    ["cape_none", "Без плаща", "No cape", "Без плаща", "Bez peleryny"],
+    ["elytra", "Элитры", "Elytra", "Елітри", "Elytra"],
+    ["cape_file", "Файл…", "File…", "Файл…", "Plik…"],
+    ["cape_nick", "По нику…", "By nickname…", "За ніком…", "Po nicku…"],
+    ["cape_edit", "Рисовать", "Paint", "Малювати", "Maluj"],
+    ["cape_bad", "Это не плащ: нужен PNG 64×32 (или 46×22 от OptiFine), а этот", "Not a cape: it must be a 64×32 PNG (or 46×22 from OptiFine), this one is", "Це не плащ: потрібен PNG 64×32 (або 46×22 від OptiFine), а цей", "To nie peleryna: potrzebny PNG 64×32 (lub 46×22 z OptiFine), a ten ma"],
+    ["cape_none_found", "У этого игрока нет плаща", "This player has no cape", "У цього гравця немає плаща", "Ten gracz nie ma peleryny"],
+    ["load", "Загрузить", "Load", "Завантажити", "Wczytaj"],
+    ["skin_only", "Это работает только со скином, не с плащом", "This works on skins only, not on capes", "Це працює лише зі скіном, не з плащем", "To działa tylko ze skinem, nie z peleryną"],
+    ["animation", "Анимация", "Animation", "Анімація", "Animacja"],
+    ["anim_none", "Без анимации", "None", "Без анімації", "Brak"],
+    ["anim_run", "Бег", "Run", "Біг", "Bieg"],
+    ["anim_sneak", "Присед", "Sneak", "Присідання", "Skradanie"],
+    ["anim_swim", "Плавание", "Swim", "Плавання", "Pływanie"],
+    ["anim_sit", "Сидит", "Sit", "Сидить", "Siedzenie"],
+    ["anim_sleep", "Сон", "Sleep", "Сон", "Sen"],
+    ["anim_attack", "Удар", "Attack", "Удар", "Atak"],
+    ["pose", "Поза", "Pose", "Поза", "Poza"],
+    ["pose_choose", "Выбрать позу…", "Pick a pose…", "Вибрати позу…", "Wybierz pozę…"],
+    ["pose_stand", "Стойка", "Stand", "Стійка", "Stój"],
+    ["pose_wave", "Привет", "Wave", "Привіт", "Machanie"],
+    ["pose_point", "Указывает", "Point", "Вказує", "Wskazuje"],
+    ["pose_hands_up", "Руки вверх", "Hands up", "Руки вгору", "Ręce w górę"],
+    ["pose_tpose", "T-поза", "T-pose", "T-поза", "T-poza"],
+    ["pose_run", "Бегун", "Runner", "Бігун", "Biegacz"],
+    ["pose_sit", "Сидя", "Seated", "Сидячи", "Siedząca"],
+    ["pose_reset", "Сбросить позу", "Reset pose", "Скинути позу", "Resetuj pozę"],
+    ["pose_name", "Название позы", "Pose name", "Назва пози", "Nazwa pozy"],
+    ["pose_save", "Сохранить позу", "Save pose", "Зберегти позу", "Zapisz pozę"],
+    ["solo", "Только часть", "Isolate part", "Лише частина", "Tylko część"],
+    ["distance", "Как видно издалека", "How it looks from afar", "Як видно здалеку", "Jak wygląda z daleka"],
+    ["tab_list", "Список игроков (Tab)", "Player list (Tab)", "Список гравців (Tab)", "Lista graczy (Tab)"],
 ];
 
 pub fn t(key: &str) -> &'static str {
@@ -356,5 +417,13 @@ mod tests {
         let n = k.len();
         k.dedup();
         assert_eq!(n, k.len());
+    }
+
+    #[test]
+    fn table_driven_keys_exist() {
+        let keys = crate::render::ANIMS.iter().chain(crate::render::POSES.iter().map(|p| &p.0)).chain(crate::tools::STICKERS.iter().map(|s| &s.0));
+        for k in keys {
+            assert!(super::T.iter().any(|r| r[0] == *k), "{k}");
+        }
     }
 }

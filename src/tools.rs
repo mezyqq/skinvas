@@ -1,6 +1,6 @@
 // Pure image operations behind the editor tools and dialogs.
 use crate::colorpick::{hsv_to_rgb, rgb_to_hsv};
-use crate::skin::{self, face_at, part_faces, parts};
+use crate::skin::{self, face_at_k, part_faces, parts};
 use image::{Rgba, RgbaImage};
 
 /// Texels covered by a brush of `size` centred on (x, y).
@@ -32,19 +32,20 @@ pub fn replace_color(img: &mut RgbaImage, from: [u8; 4], to: [u8; 4]) -> usize {
     n
 }
 
-/// Which texels belong to the selected parts (None = whole image).
-fn in_parts(slim: bool, sel: Option<&[usize]>, x: u32, y: u32) -> bool {
+/// Which texels belong to the selected parts (None = whole image); `k` = texture scale.
+fn in_parts(slim: bool, k: u32, sel: Option<&[usize]>, x: u32, y: u32) -> bool {
     match sel {
         None => true,
-        Some(ps) => face_at(slim, x, y).is_some_and(|f| ps.contains(&f.0)),
+        Some(ps) => face_at_k(slim, k, x, y).is_some_and(|f| ps.contains(&f.0)),
     }
 }
 
 /// Hue shift in degrees, saturation and value multipliers.
 pub fn adjust(orig: &RgbaImage, slim: bool, sel: Option<&[usize]>, dh: f64, ms: f64, mv: f64) -> RgbaImage {
     let mut img = orig.clone();
+    let k = skin::scale(orig);
     for (x, y, p) in img.enumerate_pixels_mut() {
-        if p[3] == 0 || !in_parts(slim, sel, x, y) {
+        if p[3] == 0 || !in_parts(slim, k, sel, x, y) {
             continue;
         }
         let [h, s, v] = rgb_to_hsv(p[0] as f64 / 255., p[1] as f64 / 255., p[2] as f64 / 255.);
@@ -109,12 +110,13 @@ pub fn count_colors(img: &RgbaImage) -> usize {
     v.len()
 }
 
-/// Copy whole parts (both layers) from `src` into `dst`.
+/// Copy whole parts (both layers) from `src` into `dst` (same size).
 pub fn transfer(dst: &mut RgbaImage, src: &RgbaImage, slim: bool, sel: &[usize]) {
+    let k = skin::scale(dst);
     for &i in sel {
         for ov in [false, true] {
             for f in part_faces(&parts(slim)[i], ov) {
-                let [x, y, w, h] = f.rect;
+                let [x, y, w, h] = f.rect.map(|v| v * k);
                 for yy in y..y + h {
                     for xx in x..x + w {
                         dst.put_pixel(xx, yy, *src.get_pixel(xx, yy));
@@ -133,14 +135,15 @@ pub fn crop(img: &RgbaImage, [x, y, w, h]: [u32; 4]) -> RgbaImage {
 pub fn stamp(img: &mut RgbaImage, piece: &RgbaImage, x: i32, y: i32) {
     for (px, py, p) in piece.enumerate_pixels() {
         let (tx, ty) = (x + px as i32, y + py as i32);
-        if (0..64).contains(&tx) && (0..64).contains(&ty) {
+        if (0..img.width() as i32).contains(&tx) && (0..img.height() as i32).contains(&ty) {
             img.put_pixel(tx as u32, ty as u32, *p);
         }
     }
 }
 
 pub fn clear_rect(img: &mut RgbaImage, [x, y, w, h]: [u32; 4]) {
-    skin::fill_rect(img, [x, y, w.min(64 - x), h.min(64 - y)], [0; 4]);
+    let (iw, ih) = img.dimensions();
+    skin::fill_rect(img, [x, y, w.min(iw - x), h.min(ih - y)], [0; 4]);
 }
 
 #[derive(Debug, PartialEq)]
@@ -155,8 +158,9 @@ pub enum Issue {
 
 pub fn check(img: &RgbaImage, slim: bool) -> Vec<Issue> {
     let (mut tb, mut un, mut st) = (0, 0, 0);
+    let k = skin::scale(img);
     for (x, y, p) in img.enumerate_pixels() {
-        match face_at(slim, x, y) {
+        match face_at_k(slim, k, x, y) {
             Some((_, false, _)) if p[3] < 255 => tb += 1,
             Some((_, true, _)) if p[3] > 0 && p[3] < 255 => st += 1,
             None if p[3] > 0 => un += 1,
@@ -169,8 +173,9 @@ pub fn check(img: &RgbaImage, slim: bool) -> Vec<Issue> {
 /// Fixes every issue `check` reports.
 pub fn fix(img: &mut RgbaImage, slim: bool) {
     let mut out = img.clone();
+    let k = skin::scale(img);
     for (x, y, p) in img.enumerate_pixels() {
-        match face_at(slim, x, y) {
+        match face_at_k(slim, k, x, y) {
             Some((_, false, rect)) if p[3] < 255 => {
                 // Fill with the face's average opaque colour, or keep the RGB and make it opaque.
                 let [rx, ry, rw, rh] = rect;
@@ -284,6 +289,89 @@ pub fn random_skin(seed: u64) -> RgbaImage {
     img
 }
 
+// --- stickers, palettes, capes ---
+
+/// Stickers: (name key, rows). '.' is clear, 'c' the current colour, 'd' a darker shade of it, other letters fixed colours.
+pub const STICKERS: [(&str, &[&str]); 12] = [
+    ("st_eyes", &["wc..cw"]),
+    ("st_eyes_big", &["ww..ww", "wc..cw"]),
+    ("st_brows", &["k....k", ".k..k."]),
+    ("st_smile", &["k....k", ".kkkk."]),
+    ("st_blush", &["pp....pp"]),
+    ("st_beard", &["c......c", "cc.kk.cc", "cccccccc", ".cccccc."]),
+    ("st_shades", &["kkkkkkkk", ".kk..kk."]),
+    ("st_belt", &["kkkyykkk"]),
+    ("st_buttons", &["y", ".", "y", ".", "y"]),
+    ("st_heart", &[".c.c.", "ccccc", ".ccc.", "..c.."]),
+    ("st_star", &["..c..", "ccccc", ".ccc.", "c...c"]),
+    ("st_tie", &["ccc", ".c.", ".c.", "ccc", "ccc", ".c."]),
+];
+
+/// Sticker `i` painted with colour `c`, scaled `k` times for HD skins.
+pub fn sticker(i: usize, c: [u8; 4], k: u32) -> RgbaImage {
+    let rows = STICKERS[i % STICKERS.len()].1;
+    let img = RgbaImage::from_fn(rows[0].len() as u32, rows.len() as u32, |x, y| {
+        Rgba(match rows[y as usize].as_bytes()[x as usize] {
+            b'c' => c,
+            b'd' => shade(c, 0.7),
+            b'w' => [245, 245, 245, 255],
+            b'k' => [25, 25, 30, 255],
+            b'p' => [240, 130, 150, 255],
+            b'y' => [250, 200, 60, 255],
+            _ => [0; 4],
+        })
+    });
+    image::imageops::resize(&img, img.width() * k, img.height() * k, image::imageops::FilterType::Nearest)
+}
+
+/// Colours from a GIMP .gpl, a Lospec .hex or a Paint.NET .txt palette (max 64).
+pub fn parse_palette(text: &str) -> Vec<[u8; 4]> {
+    let mut out = vec![];
+    for l in text.lines().map(str::trim) {
+        let nums: Vec<u8> = l.split_whitespace().take(3).filter_map(|n| n.parse().ok()).collect();
+        let hex = l.trim_start_matches('#');
+        let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+        let c = if nums.len() == 3 {
+            Some([nums[0], nums[1], nums[2], 255])
+        } else if hex.len() == 6 && hex.is_ascii() {
+            byte(0).zip(byte(2)).zip(byte(4)).map(|((r, g), b)| [r, g, b, 255])
+        } else if hex.len() == 8 && hex.is_ascii() {
+            // Paint.NET: AARRGGBB.
+            byte(2).zip(byte(4)).zip(byte(6)).map(|((r, g), b)| [r, g, b, 255])
+        } else {
+            None
+        };
+        if let Some(c) = c.filter(|c| !out.contains(c)) {
+            out.push(c);
+        }
+    }
+    out.truncate(64);
+    out
+}
+
+/// The palette colour closest to `c` (alpha kept, so the eraser still erases).
+pub fn nearest(pal: &[[u8; 4]], c: [u8; 4]) -> [u8; 4] {
+    let d = |p: &[u8; 4]| (0..3).map(|i| (p[i] as i32 - c[i] as i32).pow(2)).sum::<i32>();
+    match pal.iter().min_by_key(|p| d(p)) {
+        Some(p) if c[3] > 0 => [p[0], p[1], p[2], c[3]],
+        _ => c,
+    }
+}
+
+/// A plain 64x32 cape (and elytra) in colour `c` with a darker rim, to start painting on.
+pub fn plain_cape(c: [u8; 4]) -> RgbaImage {
+    let mut img = RgbaImage::new(64, 32);
+    for [x, y, w, h] in skin::cape_faces() {
+        for yy in 0..h {
+            for xx in 0..w {
+                let rim = xx == 0 || yy == 0 || xx + 1 == w || yy + 1 == h;
+                img.put_pixel(x + xx, y + yy, Rgba(shade(c, if rim { 0.7 } else { 1. })));
+            }
+        }
+    }
+    img
+}
+
 pub fn rotate90(img: &RgbaImage) -> RgbaImage {
     image::imageops::rotate90(img)
 }
@@ -331,6 +419,34 @@ mod tests {
         let a = armor_texture(0x4EE6D6, false);
         assert!(a.get_pixel(12, 2)[3] > 0); // helmet top
         assert_eq!(a.get_pixel(12, 13)[3], 0); // face opening
+    }
+
+    #[test]
+    fn palettes_parse_and_snap() {
+        let gpl = "GIMP Palette\nName: x\n#\n255 0 0\tRed\n 0 0 255 Blue\n";
+        assert_eq!(parse_palette(gpl), vec![[255, 0, 0, 255], [0, 0, 255, 255]]);
+        assert_eq!(parse_palette("ff8000\n#00ff00\nFF102030\n"), vec![[255, 128, 0, 255], [0, 255, 0, 255], [16, 32, 48, 255]]);
+        let pal = [[255, 0, 0, 255], [0, 0, 255, 255]];
+        assert_eq!(nearest(&pal, [200, 30, 40, 255]), [255, 0, 0, 255]);
+        assert_eq!(nearest(&pal, [0; 4]), [0; 4]);
+    }
+
+    #[test]
+    fn stickers_and_hd_tools() {
+        for i in 0..STICKERS.len() {
+            assert!(STICKERS[i].1.iter().all(|r| r.len() == STICKERS[i].1[0].len()), "{}", STICKERS[i].0);
+        }
+        let s = sticker(0, [1, 2, 3, 255], 2);
+        assert_eq!(s.dimensions(), (12, 2));
+        assert_eq!(s.get_pixel(2, 0).0, [1, 2, 3, 255]);
+        let mut hd = skin::fit(&skin::default_skin(), 128, 128);
+        assert!(check(&hd, false).is_empty());
+        hd.put_pixel(0, 0, Rgba([1, 2, 3, 255]));
+        assert_eq!(check(&hd, false), vec![Issue::Unused(1)]);
+        let mut dst = RgbaImage::new(128, 128);
+        transfer(&mut dst, &hd, false, &[skin::HEAD]);
+        assert_eq!(dst.get_pixel(30, 30), hd.get_pixel(30, 30));
+        assert!(plain_cape([9, 9, 9, 255]).get_pixel(5, 5)[3] == 255);
     }
 
     #[test]
@@ -468,7 +584,11 @@ pub const PIC_TARGETS: [&str; 4] = ["pic_front", "pic_face", "pic_chest", "pic_b
 pub fn picture(dst: &mut RgbaImage, pic: &image::DynamicImage, slim: bool, target: usize) {
     use image::imageops::FilterType;
     let ps = parts(slim);
+    let k = skin::scale(dst);
     let put = |dst: &mut RgbaImage, rect: [u32; 4], src: &RgbaImage, sx: u32, sy: u32| {
+        let rect = rect.map(|v| v * k);
+        let src = &image::imageops::resize(src, src.width() * k, src.height() * k, FilterType::Nearest);
+        let (sx, sy) = (sx * k, sy * k);
         for y in 0..rect[3] {
             for x in 0..rect[2] {
                 let c = src.get_pixel(sx + x, sy + y);
@@ -505,7 +625,7 @@ fn luma(p: &Rgba<u8>) -> f64 {
 pub fn normal_map(img: &RgbaImage, slim: bool) -> RgbaImage {
     let mut out = RgbaImage::new(64, 64);
     for (x, y, p) in img.enumerate_pixels() {
-        let Some((_, _, [rx, ry, rw, rh])) = face_at(slim, x, y) else { continue };
+        let Some((_, _, [rx, ry, rw, rh])) = face_at_k(slim, 1, x, y) else { continue };
         if p[3] == 0 {
             continue;
         }

@@ -192,7 +192,7 @@ pub fn obj(img: &RgbaImage, slim: bool, voxels: bool, name: &str) -> (String, St
             o += &format!("v {:.4} {:.4} {:.4}\n", v[0] / 16., v[1] / 16., v[2] / 16.);
         }
         for uv in quad.uv {
-            o += &format!("vt {:.5} {:.5}\n", uv[0] / 64., 1. - uv[1] / 64.);
+            o += &format!("vt {:.5} {:.5}\n", uv[0] / img.width() as f32, 1. - uv[1] / img.height() as f32);
         }
         o += &format!("vn {} {} {}\n", quad.n[0], quad.n[1], quad.n[2]);
         let (b, n) = (i * 4 + 1, i + 1);
@@ -235,7 +235,7 @@ fn export_group(ctx: &Rc<AppCtx>) -> adw::PreferencesGroup {
         b.connect_clicked(move |_| {
             let img = {
                 let s = c.st.borrow();
-                make(&s.skin, s.slim)
+                make(&skin::fit(&s.skin, 64, 64), s.slim)
             };
             let d = gtk::FileDialog::builder().modal(true).initial_name(file).build();
             let c2 = c.clone();
@@ -438,7 +438,7 @@ fn preview(ctx: &Rc<AppCtx>, size: (i32, i32), make: fn(&RgbaImage, bool) -> Rgb
     let st = ctx.st.clone();
     area.set_draw_func(move |_, cr, w, h| {
         let s = st.borrow();
-        let img = make(&s.skin, s.slim);
+        let img = make(&skin::fit(&s.skin, 64, 64), s.slim);
         let sc = (w as f64 / img.width() as f64).min(h as f64 / img.height() as f64);
         cr.scale(sc, sc);
         let _ = cr.set_source_surface(surface(&img), 0., 0.);
@@ -495,7 +495,7 @@ pub fn page(ctx: &Rc<AppCtx>) -> gtk::Widget {
         move || {
             let o = Opts { totem: totem_r.is_active(), paintings: paint_r.is_active(), default_skin: def_r.is_active(), banner: banner_r.is_active(), helmet: helmet_r.is_active(), panorama: pano_r.is_active(), pbr: pbr_r.is_active(), format: VERSIONS[ver_r.selected() as usize].1, desc: desc_r.text().into() };
             let s = ctx.st.borrow();
-            build_zip(&s.skin, s.slim, &o)
+            build_zip(&skin::fit(&s.skin, 64, 64), s.slim, &o)
         }
     };
     let make = Rc::new(make);

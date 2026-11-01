@@ -65,7 +65,7 @@ fn paint_frame(cr: &cairo::Context, fr: &render::Frame, x: f64, y: f64, w: usize
 
 fn draw_model(cr: &cairo::Context, img: &RgbaImage, x: f64, y: f64, w: usize, h: usize, yaw: f32, walk: f32, thick: f32, voxels: bool) {
     let q = render::build(img, &ModelOpts { slim: false, base: true, overlay: true, voxels, thickness: thick });
-    let m = Model { quads: &q, img, slim: false, offset: [0.; 3], pose: render::walk_pose(walk, 0.6), explode: 0., pick: false };
+    let m = Model { quads: &q, img, slim: false, offset: [0.; 3], rig: render::Rig { pose: render::walk_pose(walk, 0.6), ..Default::default() }, explode: 0., pick: false };
     let cam = Camera { yaw, pitch: 0.18, dist: 62., fov: 35., target: [0., 16., 0.] };
     paint_frame(cr, &render::render_scene(&[m], &cam, w, h, [0; 4], [0; 4], Light::Soft), x, y, w, h);
 }

@@ -22,8 +22,8 @@ end
 "#),
     ("invert.lua", r#"name = "Invert / Инверсия"
 function run(skin)
-  for y = 0, 63 do
-    for x = 0, 63 do
+  for y = 0, skin.height - 1 do
+    for x = 0, skin.width - 1 do
       local r, g, b, a = skin:get(x, y)
       if a > 0 then skin:set(x, y, 255 - r, 255 - g, 255 - b, a) end
     end
@@ -33,8 +33,8 @@ end
     ("noise.lua", r#"name = "Fabric noise / Шум ткани"
 -- `slim` is true for slim (3px arm) skins.
 function run(skin)
-  for y = 0, 63 do
-    for x = 0, 63 do
+  for y = 0, skin.height - 1 do
+    for x = 0, skin.width - 1 do
       local r, g, b, a = skin:get(x, y)
       if a > 0 then
         local n = math.random(-10, 10)

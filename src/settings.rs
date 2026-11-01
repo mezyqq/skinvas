@@ -25,6 +25,11 @@ pub struct Settings {
     pub right_click_picks: bool,
     pub palette_size: f64,
     pub picker_size: f64,
+    /// Imported palette as "#rrggbbaa"; empty = Minecraft dye colours.
+    pub palette: Vec<String>,
+    pub palette_lock: bool,
+    /// Saved poses of the pose editor.
+    pub poses: Vec<(String, [[f32; 3]; 6])>,
     // Browser
     pub cache: bool,
     pub safe: bool,
@@ -66,6 +71,9 @@ impl Default for Settings {
             right_click_picks: true,
             palette_size: 20.,
             picker_size: 300.,
+            palette: vec![],
+            palette_lock: false,
+            poses: vec![],
             cache: false,
             safe: true,
             discord: false,

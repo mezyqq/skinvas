@@ -15,6 +15,7 @@ pub enum Tool {
     Picker,
     Replace,
     Select,
+    Stamp,
 }
 
 // Minecraft dye colours.
@@ -31,21 +32,43 @@ pub struct Doc {
     pub slim: bool,
     pub file: Option<PathBuf>,
     pub dirty: bool,
-    undo: Vec<RgbaImage>,
-    redo: Vec<RgbaImage>,
+    undo: Vec<Snap>,
+    redo: Vec<Snap>,
     before: RgbaImage,
     history: Vec<RgbaImage>,
+    layers: Vec<Layer>,
+    layer: usize,
+    cape_doc: bool,
 }
 
 impl Doc {
+    fn new(id: u64, img: RgbaImage, slim: bool, file: Option<PathBuf>, cape_doc: bool) -> Self {
+        Doc { id, before: img.clone(), skin: img, slim, file, dirty: false, undo: vec![], redo: vec![], history: vec![], layers: vec![], layer: 0, cape_doc }
+    }
+
     fn title(&self) -> String {
-        title_of(&self.file, self.dirty)
+        title_of(&self.file, self.dirty, self.cape_doc)
     }
 }
 
-fn title_of(file: &Option<PathBuf>, dirty: bool) -> String {
+fn title_of(file: &Option<PathBuf>, dirty: bool, cape: bool) -> String {
     let name = file.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned());
-    format!("{}{}", name.unwrap_or_else(|| t("untitled").into()), if dirty { " •" } else { "" })
+    format!("{}{}", name.unwrap_or_else(|| t(if cape { "cape" } else { "untitled" }).into()), if dirty { " •" } else { "" })
+}
+
+/// A paint layer. `State::skin` is always the merge of the visible layers.
+#[derive(Clone)]
+pub struct Layer {
+    pub name: String,
+    pub img: RgbaImage,
+    pub visible: bool,
+}
+
+/// One undo step: the merged image and, in layered docs, every layer.
+#[derive(Clone)]
+struct Snap {
+    skin: RgbaImage,
+    layers: Vec<Layer>,
 }
 
 enum SelDrag {
@@ -61,8 +84,19 @@ pub struct State {
     pub slim: bool,
     pub file: Option<PathBuf>,
     pub dirty: bool,
-    undo: Vec<RgbaImage>,
-    redo: Vec<RgbaImage>,
+    undo: Vec<Snap>,
+    redo: Vec<Snap>,
+    /// Paint layers, bottom first; empty = a plain one-layer skin and tools paint on `skin` directly.
+    pub layers: Vec<Layer>,
+    pub layer: usize,
+    /// This tab holds a cape (64x32 cape + elytra layout), not a skin.
+    pub cape_doc: bool,
+    /// Cape worn in the 3D view and how: 0 hidden, 1 cape, 2 elytra.
+    pub cape: Option<RgbaImage>,
+    pub cape_mode: u32,
+    /// The skin that wears the cape while a cape tab is open (the last skin tab).
+    wearer: (RgbaImage, bool),
+    pub sticker: usize,
     /// The skin as it was when opened or last saved ("before / after").
     before: RgbaImage,
     /// Every stroke's starting state, for the timelapse.
@@ -88,7 +122,12 @@ pub struct State {
     pub voxels: bool,
     pub paint3d: bool,
     pub paint_overlay: bool,
-    pub walk: bool,
+    /// Looping animation, index into `render::ANIMS`.
+    pub anim: usize,
+    /// Pose editor rotations, added on top of the animation.
+    pub pose: render::Pose,
+    /// Show only this part in 3D, to reach its hidden sides.
+    pub solo: Option<usize>,
     pub spin: bool,
     /// 0 studio, 1 like in game, 2 day, 3 night with a torch.
     pub scene: u32,
@@ -126,6 +165,13 @@ impl State {
             dirty: false,
             undo: vec![],
             redo: vec![],
+            layers: vec![],
+            layer: 0,
+            cape_doc: false,
+            cape: None,
+            cape_mode: 0,
+            wearer: (skin::starter(), s.slim_default),
+            sticker: 0,
             before: skin::starter(),
             history: vec![],
             tabs: vec![None],
@@ -149,7 +195,9 @@ impl State {
             voxels: s.layers3d,
             paint3d: false,
             paint_overlay: false,
-            walk: s.walk,
+            anim: s.walk as usize,
+            pose: [[0.; 3]; 6],
+            solo: None,
             spin: s.auto_rotate,
             scene: 0,
             item: 0,
@@ -180,12 +228,18 @@ impl State {
     }
 
     pub fn title(&self) -> String {
-        title_of(&self.file, self.dirty)
+        title_of(&self.file, self.dirty, self.cape_doc)
     }
 
     // --- tabs ---
 
     fn take_current(&mut self) -> Doc {
+        // A cape tab's art is the cape skins wear; a skin tab is what cape tabs show it on.
+        if self.cape_doc {
+            self.cape = Some(self.skin.clone());
+        } else {
+            self.wearer = (self.skin.clone(), self.slim);
+        }
         Doc {
             id: self.id,
             skin: std::mem::replace(&mut self.skin, RgbaImage::new(64, 64)),
@@ -196,11 +250,15 @@ impl State {
             redo: std::mem::take(&mut self.redo),
             before: std::mem::replace(&mut self.before, RgbaImage::new(64, 64)),
             history: std::mem::take(&mut self.history),
+            layers: std::mem::take(&mut self.layers),
+            layer: self.layer,
+            cape_doc: self.cape_doc,
         }
     }
 
     fn load_doc(&mut self, d: Doc) {
         (self.id, self.skin, self.slim, self.file, self.dirty, self.undo, self.redo, self.before, self.history) = (d.id, d.skin, d.slim, d.file, d.dirty, d.undo, d.redo, d.before, d.history);
+        (self.layers, self.layer, self.cape_doc) = (d.layers, d.layer, d.cape_doc);
         self.compare = None;
         self.sel = None;
         self.sel_drag = None;
@@ -212,9 +270,19 @@ impl State {
 
     /// Opens a skin in a new tab (or reuses the current tab if it is an untouched new skin).
     pub fn open_doc(&mut self, img: RgbaImage, slim: bool, file: Option<PathBuf>, force_new_tab: bool) {
+        self.open(img, slim, file, force_new_tab, false);
+    }
+
+    /// Opens a cape (64x32 layout) in its own tab; the 3D view shows it on the last skin.
+    pub fn open_cape(&mut self, img: RgbaImage, file: Option<PathBuf>) {
+        self.cape_mode = self.cape_mode.max(1);
+        self.open(img, false, file, true, true);
+    }
+
+    fn open(&mut self, img: RgbaImage, slim: bool, file: Option<PathBuf>, force_new_tab: bool, cape_doc: bool) {
         let id = self.next_id;
         self.next_id += 1;
-        let doc = Doc { id, before: img.clone(), skin: img, slim, file, dirty: false, undo: vec![], redo: vec![], history: vec![] };
+        let doc = Doc::new(id, img, slim, file, cape_doc);
         if self.pristine() && !force_new_tab {
             self.load_doc(doc);
         } else {
@@ -251,8 +319,7 @@ impl State {
             let slim = self.settings.slim_default;
             let id = self.next_id;
             self.next_id += 1;
-            let st = skin::starter();
-            self.load_doc(Doc { id, skin: st.clone(), before: st, slim, file: None, dirty: false, undo: vec![], redo: vec![], history: vec![] });
+            self.load_doc(Doc::new(id, skin::starter(), slim, None, false));
         } else if i == self.active {
             self.tabs.remove(i);
             self.active = i.min(self.tabs.len() - 1);
@@ -279,21 +346,21 @@ impl State {
         (0..self.tabs.len()).any(|i| self.tab_dirty(i))
     }
 
-    /// (id, skin, slim, file) of every unsaved tab, for crash recovery.
-    pub fn dirty_docs(&self) -> Vec<(u64, &RgbaImage, bool, Option<&PathBuf>)> {
+    /// (id, skin, slim, file, is a cape) of every unsaved tab, for crash recovery.
+    pub fn dirty_docs(&self) -> Vec<(u64, &RgbaImage, bool, Option<&PathBuf>, bool)> {
         let mut v = vec![];
         if self.dirty {
-            v.push((self.id, &self.skin, self.slim, self.file.as_ref()));
+            v.push((self.id, &self.skin, self.slim, self.file.as_ref(), self.cape_doc));
         }
         for d in self.tabs.iter().flatten().filter(|d| d.dirty) {
-            v.push((d.id, &d.skin, d.slim, d.file.as_ref()));
+            v.push((d.id, &d.skin, d.slim, d.file.as_ref(), d.cape_doc));
         }
         v
     }
 
     /// Swaps the skin of an untouched new tab (used when Steve finishes downloading).
     pub fn replace_pristine(&mut self, img: RgbaImage) {
-        if self.pristine() {
+        if self.pristine() && !self.cape_doc {
             self.before = img.clone();
             self.skin = img;
             self.refresh();
@@ -319,32 +386,54 @@ impl State {
 
     /// Renders the 3D scene as configured. `img` overrides the edited skin (for "before").
     pub fn render_view(&self, w: usize, h: usize, yaw: f32, anim_t: f32, img: Option<&RgbaImage>, transparent: bool) -> Frame {
-        let skin_img = img.unwrap_or(&self.skin);
-        let opts = ModelOpts { slim: self.slim, base: self.show_base, overlay: self.show_overlay, voxels: self.voxels, thickness: self.settings.thickness as f32 };
-        let mut pose = if self.walk { render::walk_pose(anim_t, 0.7) } else { [[0.; 3]; 6] };
-        let jump = self.emote_pose(&mut pose);
+        self.render_view_at(w, h, yaw, anim_t, img, transparent, self.dist)
+    }
+
+    /// `render_view` with the camera `dist` units away.
+    pub fn render_view_at(&self, w: usize, h: usize, yaw: f32, anim_t: f32, img: Option<&RgbaImage>, transparent: bool, dist: f32) -> Frame {
+        let edited = img.unwrap_or(&self.skin);
+        // A cape tab shows its cape on the last skin; a skin tab shows the worn cape, if any.
+        let (skin_img, slim, cape) = if self.cape_doc { (&self.wearer.0, self.wearer.1, Some(edited)) } else { (edited, self.slim, self.cape.as_ref().filter(|_| self.cape_mode > 0)) };
+        let opts = ModelOpts { slim, base: self.show_base, overlay: self.show_overlay, voxels: self.voxels, thickness: self.settings.thickness as f32 };
+        let mut rig = render::anim(self.anim, anim_t);
+        for (p, c) in rig.pose.iter_mut().zip(self.pose) {
+            *p = [p[0] + c[0], p[1] + c[1], p[2] + c[2]];
+        }
+        let jump = self.emote_pose(&mut rig.pose);
         let other = self.compare.and_then(|i| self.tab_skin(i));
         let x = if other.is_some() { -11. } else { 0. };
-        let x3 = [x, jump, 0.];
-        // Owned meshes/textures first, then borrowed into Models.
-        let mut meshes: Vec<(Vec<render::Quad>, RgbaImage, bool, [f32; 3], bool)> = vec![(render::build(skin_img, &opts), skin_img.clone(), self.slim, x3, true)];
-        if self.armor > 0 {
-            let tex = tools::armor_texture(tools::ARMORS[self.armor].1, self.slim);
-            meshes.push((render::shell(self.slim, |i| if i >= skin::RLEG { 0.6 } else { 1.05 }), tex, self.slim, x3, false));
+        let mut x3 = [x, jump, 0.];
+        let mut main = render::build(skin_img, &opts);
+        if let Some(i) = self.solo {
+            // Only that part, moved to the middle of the view.
+            main.retain(|q| q.part as usize == i);
+            let p = skin::parts(slim)[i];
+            x3 = [x - p.min[0] - p.size[0] as f32 / 2., jump + 16. - p.min[1] - p.size[1] as f32 / 2., -p.min[2] - p.size[2] as f32 / 2.];
         }
-        if self.item > 0 {
-            let spr = tools::item_sprite(self.item, skin_img, self.slim);
+        // Owned meshes/textures first, then borrowed into Models.
+        let mut meshes: Vec<(Vec<render::Quad>, RgbaImage, bool, [f32; 3], bool)> = vec![(main, skin_img.clone(), slim, x3, !self.cape_doc)];
+        if self.armor > 0 && self.solo.is_none() {
+            let tex = tools::armor_texture(tools::ARMORS[self.armor].1, slim);
+            meshes.push((render::shell(slim, |i| if i >= skin::RLEG { 0.6 } else { 1.05 }), tex, slim, x3, false));
+        }
+        if self.item > 0 && self.solo.is_none() {
+            let spr = tools::item_sprite(self.item, &skin::fit(skin_img, 64, 64), slim);
             // Held in the right hand, pointing forward and up (0.6 units per sprite pixel).
             let k = 0.6;
             let q = render::extrude(&spr, [-6.3, 10.5 + 13. * k, 1. - 2. * k], [0., 0., k], [0., -k, 0.], [k, 0., 0.], skin::RARM as u8);
-            meshes.push((q, spr, self.slim, x3, false));
+            meshes.push((q, spr, slim, x3, false));
+        }
+        if let Some(c) = cape.filter(|_| self.solo.is_none_or(|i| i == skin::BODY)) {
+            // Hangs a little away from the back, more and fluttering while moving.
+            let tilt = 0.12 + if self.anim > 0 { 0.25 + (anim_t * 2.).sin() * 0.06 } else { 0. };
+            meshes.push((render::cape(self.cape_mode == 2, tilt, skin::scale(c)), c.clone(), slim, x3, self.cape_doc));
         }
         if let Some((oimg, oslim)) = other {
             let o2 = ModelOpts { slim: oslim, ..opts };
             meshes.push((render::build(&oimg, &o2), oimg, oslim, [11., 0., 0.], false));
         }
-        let models: Vec<render::Model> = meshes.iter().map(|(q, i, slim, off, pick)| render::Model { quads: q, img: i, slim: *slim, offset: *off, pose, explode: self.explode, pick: *pick }).collect();
-        let cam = Camera { yaw, pitch: self.pitch, dist: self.dist, fov: self.settings.fov as f32, target: [0., 16., 0.] };
+        let models: Vec<render::Model> = meshes.iter().map(|(q, i, slim, off, pick)| render::Model { quads: q, img: i, slim: *slim, offset: *off, rig, explode: self.explode, pick: *pick }).collect();
+        let cam = Camera { yaw, pitch: self.pitch, dist, fov: self.settings.fov as f32, target: [0., 16., 0.] };
         let (top, bottom, light) = match self.scene {
             0 if transparent => ([0; 4], [0; 4], if self.settings.shading { render::Light::Soft } else { render::Light::Flat }),
             1 | 2 => ([111, 168, 255, 255], [207, 227, 255, 255], render::Light::Minecraft),
@@ -407,6 +496,75 @@ impl State {
 
     // --- painting ---
 
+    /// The image tools paint on: the active layer, or the skin itself when there are no layers.
+    pub fn canvas(&mut self) -> &mut RgbaImage {
+        match self.layers.get_mut(self.layer) {
+            Some(l) => &mut l.img,
+            None => &mut self.skin,
+        }
+    }
+
+    pub fn canvas_ref(&self) -> &RgbaImage {
+        self.layers.get(self.layer).map_or(&self.skin, |l| &l.img)
+    }
+
+    /// Rebuilds `skin` from the visible layers (nothing to do without layers).
+    pub fn compose(&mut self) {
+        let Some(first) = self.layers.first() else { return };
+        let mut out = RgbaImage::new(first.img.width(), first.img.height());
+        for l in self.layers.iter().filter(|l| l.visible) {
+            image::imageops::overlay(&mut out, &l.img, 0, 0);
+        }
+        self.skin = out;
+    }
+
+    fn snap(&self) -> Snap {
+        Snap { skin: self.skin.clone(), layers: self.layers.clone() }
+    }
+
+    /// Puts a snapshot back and returns the state it replaced.
+    fn restore(&mut self, s: Snap) -> Snap {
+        let cur = self.snap();
+        (self.skin, self.layers) = (s.skin, s.layers);
+        self.layer = self.layer.min(self.layers.len().saturating_sub(1));
+        // The image size may have changed (HD switch), so a selection could point outside it.
+        self.sel = None;
+        self.dirty = true;
+        cur
+    }
+
+    /// UV face under texel (x, y), so brushes and fills never spill onto a neighbouring face.
+    fn face_rect(&self, x: u32, y: u32) -> [u32; 4] {
+        let k = skin::scale(&self.skin);
+        let r = if self.cape_doc {
+            skin::cape_faces().into_iter().map(|r| r.map(|v| v * k)).find(|&[rx, ry, rw, rh]| x >= rx && y >= ry && x < rx + rw && y < ry + rh)
+        } else {
+            skin::face_at_k(self.slim, k, x, y).map(|f| f.2)
+        };
+        r.unwrap_or([0, 0, self.skin.width(), self.skin.height()])
+    }
+
+    /// The current colour, snapped to the palette when "palette colours only" is on.
+    fn paint_color(&self) -> [u8; 4] {
+        if self.settings.palette_lock { tools::nearest(&palette_colors(&self.settings), self.color) } else { self.color }
+    }
+
+    /// Status bar text: "Head · front (outer layer) · x 3, y 5".
+    fn describe(&self, x: u32, y: u32) -> String {
+        let k = skin::scale(&self.skin);
+        if self.cape_doc {
+            return format!("{} [{x}, {y}]", t("cape"));
+        }
+        match skin::face_info(self.slim, x / k, y / k) {
+            Some((p, ov, f, lx, ly)) => {
+                let part = PARTS[p];
+                let face = ["face_right", "face_front", "face_left", "face_back", "face_top", "face_bottom"][f];
+                format!("{} · {} ({}) · x {}, y {}   [{x}, {y}]", t(part), t(face), t(if ov { "overlay" } else { "base" }), lx * k + x % k, ly * k + y % k)
+            }
+            None => format!("{} [{x}, {y}]", t("unused_area")),
+        }
+    }
+
     fn begin(&mut self) {
         self.stroke_open = true;
         self.last_texel = None;
@@ -420,7 +578,7 @@ impl State {
     fn snapshot(&mut self) {
         if self.stroke_open {
             self.stroke_open = false;
-            self.undo.push(self.skin.clone());
+            self.undo.push(self.snap());
             self.history.push(self.skin.clone());
             if self.history.len() > 600 {
                 // Keep the whole story but at half the frame rate.
@@ -451,62 +609,169 @@ impl State {
 
     /// Applies the current tool at texel (x, y). Returns a colour if the eyedropper picked one.
     fn apply(&mut self, x: u32, y: u32) -> Option<[u8; 4]> {
-        if x >= 64 || y >= 64 {
+        if x >= self.skin.width() || y >= self.skin.height() {
             return None;
         }
-        let cur = self.skin.get_pixel(x, y).0;
+        let cur = self.canvas_ref().get_pixel(x, y).0;
+        let paint = self.paint_color();
+        let inside = |[rx, ry, rw, rh]: [u32; 4], px: i32, py: i32| px >= rx as i32 && py >= ry as i32 && px < (rx + rw) as i32 && py < (ry + rh) as i32;
         match self.tool_now() {
             Tool::Picker => {
-                self.color = cur;
-                return Some(cur);
+                // What you see, through all layers.
+                let c = self.skin.get_pixel(x, y).0;
+                self.color = c;
+                return Some(c);
             }
             Tool::Pencil | Tool::Eraser => {
-                let c = if self.tool_now() == Tool::Pencil { self.color } else { [0; 4] };
+                let c = if self.tool_now() == Tool::Pencil { paint } else { [0; 4] };
                 // The brush never spills over into a neighbouring UV face.
-                let [rx, ry, rw, rh] = skin::face_at(self.slim, x, y).map(|f| f.2).unwrap_or([0, 0, 64, 64]);
+                let rect = self.face_rect(x, y);
                 for (px, py) in tools::brush(x as i32, y as i32, self.brush_now(), self.round) {
-                    if px < rx as i32 || py < ry as i32 || px >= (rx + rw) as i32 || py >= (ry + rh) as i32 {
-                        continue;
-                    }
-                    if self.skin.get_pixel(px as u32, py as u32).0 != c {
+                    if inside(rect, px, py) && self.canvas_ref().get_pixel(px as u32, py as u32).0 != c {
                         self.snapshot();
-                        self.skin.put_pixel(px as u32, py as u32, Rgba(c));
+                        self.canvas().put_pixel(px as u32, py as u32, Rgba(c));
                     }
                 }
             }
             Tool::Fill => {
-                let rect = skin::face_at(self.slim, x, y).map(|f| f.2).unwrap_or([0, 0, 64, 64]);
-                if cur != self.color {
+                let rect = self.face_rect(x, y);
+                if cur != paint {
                     self.snapshot();
-                    flood(&mut self.skin, x, y, rect, self.color);
+                    flood(self.canvas(), x, y, rect, paint);
                 }
             }
             Tool::Replace => {
-                if cur != self.color {
+                if cur != paint {
                     self.snapshot();
-                    tools::replace_color(&mut self.skin, cur, self.color);
+                    tools::replace_color(self.canvas(), cur, paint);
+                }
+            }
+            Tool::Stamp => {
+                // Centred on the click, clipped to the face like the brush; clear sticker texels keep what's under them.
+                let rect = self.face_rect(x, y);
+                let st = tools::sticker(self.sticker, paint, skin::scale(&self.skin));
+                let (ox, oy) = (x as i32 - st.width() as i32 / 2, y as i32 - st.height() as i32 / 2);
+                for (sx, sy, p) in st.enumerate_pixels() {
+                    let (px, py) = (ox + sx as i32, oy + sy as i32);
+                    if p[3] > 0 && inside(rect, px, py) && self.canvas_ref().get_pixel(px as u32, py as u32) != p {
+                        self.snapshot();
+                        self.canvas().put_pixel(px as u32, py as u32, *p);
+                    }
                 }
             }
             Tool::Select => {}
         }
+        self.compose();
         self.refresh();
         None
     }
 
     pub fn undo(&mut self) {
-        if let Some(img) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.skin, img));
-            self.dirty = true;
+        if let Some(s) = self.undo.pop() {
+            let cur = self.restore(s);
+            self.redo.push(cur);
             self.refresh();
         }
     }
 
     pub fn redo(&mut self) {
-        if let Some(img) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.skin, img));
-            self.dirty = true;
+        if let Some(s) = self.redo.pop() {
+            let cur = self.restore(s);
+            self.undo.push(cur);
             self.refresh();
         }
+    }
+
+    // --- layers ---
+
+    pub fn layer_add(&mut self) {
+        self.checkpoint();
+        if self.layers.is_empty() {
+            self.layers.push(Layer { name: format!("{} 1", t("layer")), img: self.skin.clone(), visible: true });
+        }
+        let (w, h) = self.skin.dimensions();
+        let n = self.layers.len() + 1;
+        self.layer = (self.layer + 1).min(self.layers.len());
+        self.layers.insert(self.layer, Layer { name: format!("{} {n}", t("layer")), img: RgbaImage::new(w, h), visible: true });
+        self.refresh();
+    }
+
+    pub fn layer_delete(&mut self) {
+        if self.layers.len() < 2 {
+            return;
+        }
+        self.checkpoint();
+        self.layers.remove(self.layer);
+        self.layer = self.layer.saturating_sub(1);
+        self.layers_changed();
+    }
+
+    /// Swaps the active layer with the one above (`up`) or below.
+    pub fn layer_move(&mut self, up: bool) {
+        let j = if up { self.layer + 1 } else { self.layer.wrapping_sub(1) };
+        if j >= self.layers.len() {
+            return;
+        }
+        self.checkpoint();
+        self.layers.swap(self.layer, j);
+        self.layer = j;
+        self.layers_changed();
+    }
+
+    pub fn layer_merge_down(&mut self) {
+        if self.layer == 0 || self.layer >= self.layers.len() {
+            return;
+        }
+        self.checkpoint();
+        let top = self.layers.remove(self.layer);
+        self.layer -= 1;
+        if top.visible {
+            image::imageops::overlay(&mut self.layers[self.layer].img, &top.img, 0, 0);
+        }
+        self.layers_changed();
+    }
+
+    pub fn layer_toggle(&mut self, i: usize) {
+        if i < self.layers.len() {
+            self.checkpoint();
+            self.layers[i].visible = !self.layers[i].visible;
+            self.layers_changed();
+        }
+    }
+
+    pub fn layer_select(&mut self, i: usize) {
+        self.layer = i.min(self.layers.len().saturating_sub(1));
+        self.refresh();
+    }
+
+    /// Merges everything visible into one plain layer.
+    pub fn flatten(&mut self) {
+        self.layers.clear();
+        self.layer = 0;
+    }
+
+    fn layers_changed(&mut self) {
+        // A single layer left: back to a plain skin.
+        if self.layers.len() == 1 {
+            self.skin = self.layers.pop().unwrap().img;
+            self.layer = 0;
+        }
+        self.compose();
+        self.refresh();
+    }
+
+    /// Skins 64x64 <-> 128x128 HD (capes 64x32 <-> 128x64), every layer included. One undo step.
+    pub fn toggle_hd(&mut self) {
+        let (w, h) = self.skin.dimensions();
+        let (nw, nh) = if w == 64 { (128, h * 2) } else { (64, h * 64 / w) };
+        self.checkpoint();
+        self.skin = skin::fit(&self.skin, nw, nh);
+        for l in &mut self.layers {
+            l.img = skin::fit(&l.img, nw, nh);
+        }
+        self.sel = None;
+        self.clip = None;
+        self.refresh();
     }
 
     fn paint_line(&mut self, x: i32, y: i32) {
@@ -526,7 +791,13 @@ impl State {
 
     fn paint_3d(&mut self, x: f64, y: f64) -> Option<[u8; 4]> {
         let (u, v, ov) = self.pick_3d(x, y)?;
-        let (u, v) = if self.paint_overlay && !ov && self.tool != Tool::Picker { skin::to_overlay(self.slim, u, v) } else { (u, v) };
+        let k = skin::scale(&self.skin);
+        let (u, v) = if self.paint_overlay && !ov && self.tool != Tool::Picker && !self.cape_doc {
+            let (ou, ov) = skin::to_overlay(self.slim, u / k, v / k);
+            (ou * k + u % k, ov * k + v % k)
+        } else {
+            (u, v)
+        };
         self.apply(u, v)
     }
 
@@ -534,7 +805,7 @@ impl State {
 
     pub fn sel_copy(&mut self) {
         if let Some(r) = self.sel {
-            self.clip = Some(tools::crop(&self.skin, r));
+            self.clip = Some(tools::crop(self.canvas_ref(), r));
         }
     }
 
@@ -545,27 +816,32 @@ impl State {
     pub fn sel_paste(&mut self) {
         let Some(c) = self.clip.clone() else { return };
         let (x, y) = self.sel.map(|r| (r[0], r[1])).unwrap_or((0, 0));
+        let (w, h) = self.skin.dimensions();
         self.checkpoint();
-        tools::stamp(&mut self.skin, &c, x as i32, y as i32);
-        self.sel = Some([x, y, c.width().min(64 - x), c.height().min(64 - y)]);
+        tools::stamp(self.canvas(), &c, x as i32, y as i32);
+        self.sel = Some([x, y, c.width().min(w - x), c.height().min(h - y)]);
+        self.compose();
         self.refresh();
     }
 
     pub fn sel_delete(&mut self) {
         if let Some(r) = self.sel {
             self.checkpoint();
-            tools::clear_rect(&mut self.skin, r);
+            tools::clear_rect(self.canvas(), r);
+            self.compose();
             self.refresh();
         }
     }
 
     pub fn sel_transform(&mut self, f: fn(&RgbaImage) -> RgbaImage) {
         let Some(r) = self.sel else { return };
-        let piece = f(&tools::crop(&self.skin, r));
+        let piece = f(&tools::crop(self.canvas_ref(), r));
+        let (w, h) = self.skin.dimensions();
         self.checkpoint();
-        tools::clear_rect(&mut self.skin, r);
-        tools::stamp(&mut self.skin, &piece, r[0] as i32, r[1] as i32);
-        self.sel = Some([r[0], r[1], piece.width().min(64 - r[0]), piece.height().min(64 - r[1])]);
+        tools::clear_rect(self.canvas(), r);
+        tools::stamp(self.canvas(), &piece, r[0] as i32, r[1] as i32);
+        self.sel = Some([r[0], r[1], piece.width().min(w - r[0]), piece.height().min(h - r[1])]);
+        self.compose();
         self.refresh();
     }
 
@@ -573,9 +849,10 @@ impl State {
         let inside = self.sel.is_some_and(|[x, y, w, h]| t.0 >= x as i32 && t.1 >= y as i32 && t.0 < (x + w) as i32 && t.1 < (y + h) as i32);
         if inside {
             let r = self.sel.unwrap();
-            let lifted = tools::crop(&self.skin, r);
+            let lifted = tools::crop(self.canvas_ref(), r);
             self.checkpoint();
-            tools::clear_rect(&mut self.skin, r);
+            tools::clear_rect(self.canvas(), r);
+            self.compose();
             self.sel_drag = Some(SelDrag::Move { start: t, lifted, orig: r, off: (0, 0) });
         } else {
             self.sel_drag = Some(SelDrag::New(t));
@@ -587,7 +864,8 @@ impl State {
     fn sel_update(&mut self, t: (i32, i32)) {
         match &mut self.sel_drag {
             Some(SelDrag::New(s)) => {
-                let (s, t) = (clamp_t(*s), clamp_t(t));
+                let dims = self.skin.dimensions();
+                let (s, t) = (clamp_t(*s, dims), clamp_t(t, dims));
                 let (x0, y0, x1, y1) = (s.0.min(t.0), s.1.min(t.1), s.0.max(t.0), s.1.max(t.1));
                 self.sel = Some([x0 as u32, y0 as u32, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32]);
             }
@@ -600,16 +878,26 @@ impl State {
     fn sel_end(&mut self) {
         if let Some(SelDrag::Move { lifted, orig, off, .. }) = self.sel_drag.take() {
             let (x, y) = (orig[0] as i32 + off.0, orig[1] as i32 + off.1);
-            tools::stamp(&mut self.skin, &lifted, x, y);
-            let (cx, cy) = (x.clamp(0, 63) as u32, y.clamp(0, 63) as u32);
-            self.sel = Some([cx, cy, orig[2].min(64 - cx), orig[3].min(64 - cy)]);
+            let (w, h) = self.skin.dimensions();
+            tools::stamp(self.canvas(), &lifted, x, y);
+            let (cx, cy) = clamp_t((x, y), (w, h));
+            let (cx, cy) = (cx as u32, cy as u32);
+            self.sel = Some([cx, cy, orig[2].min(w - cx), orig[3].min(h - cy)]);
+            self.compose();
         }
         self.refresh();
     }
 }
 
-fn clamp_t(t: (i32, i32)) -> (i32, i32) {
-    (t.0.clamp(0, 63), t.1.clamp(0, 63))
+const PARTS: [&str; 6] = ["part_head", "part_body", "part_rarm", "part_larm", "part_rleg", "part_lleg"];
+
+/// The palette row of the toolbar: an imported palette or the Minecraft dyes.
+fn palette_colors(s: &Settings) -> Vec<[u8; 4]> {
+    if s.palette.is_empty() { PALETTE.iter().map(|c| [(c >> 16) as u8, (c >> 8) as u8, *c as u8, 255]).collect() } else { s.palette.iter().map(|h| parse_hex(h)).collect() }
+}
+
+fn clamp_t(t: (i32, i32), (w, h): (u32, u32)) -> (i32, i32) {
+    (t.0.clamp(0, w as i32 - 1), t.1.clamp(0, h as i32 - 1))
 }
 
 fn flood(img: &mut RgbaImage, x: u32, y: u32, [rx, ry, rw, rh]: [u32; 4], c: [u8; 4]) {
@@ -669,23 +957,12 @@ fn set_src(cr: &cairo::Context, c: [u8; 4]) {
     cr.set_source_rgba(c[0] as f64 / 255., c[1] as f64 / 255., c[2] as f64 / 255., c[3] as f64 / 255.);
 }
 
-/// (texel size, x offset, y offset) of the 2D canvas.
-fn layout2d(w: i32, h: i32, zoom: f64, pan: (f64, f64)) -> (f64, f64, f64) {
-    let fit = ((w.min(h) as f64 - 16.) / 64.).floor().max(1.);
+/// (texel size, x offset, y offset) of the 2D canvas showing an `iw`x`ih` image.
+fn layout2d(w: i32, h: i32, (iw, ih): (u32, u32), zoom: f64, pan: (f64, f64)) -> (f64, f64, f64) {
+    let (iw, ih) = (iw as f64, ih as f64);
+    let fit = ((w as f64 - 16.) / iw).min((h as f64 - 16.) / ih).floor().max(1.);
     let s = (fit * zoom).floor().max(1.);
-    (s, ((w as f64 - 64. * s) / 2.).floor() + pan.0, ((h as f64 - 64. * s) / 2.).floor() + pan.1)
-}
-
-/// Text for the status bar: "Head · front (outer layer) · x 3, y 5".
-fn describe(slim: bool, x: u32, y: u32) -> String {
-    match skin::face_info(slim, x, y) {
-        Some((p, ov, f, lx, ly)) => {
-            let part = ["part_head", "part_body", "part_rarm", "part_larm", "part_rleg", "part_lleg"][p];
-            let face = ["face_right", "face_front", "face_left", "face_back", "face_top", "face_bottom"][f];
-            format!("{} · {} ({}) · x {lx}, y {ly}   [{x}, {y}]", t(part), t(face), t(if ov { "overlay" } else { "base" }))
-        }
-        None => format!("{} [{x}, {y}]", t("unused_area")),
-    }
+    (s, ((w as f64 - iw * s) / 2.).floor() + pan.0, ((h as f64 - ih * s) / 2.).floor() + pan.1)
 }
 
 /// Pen pressure and the pen's eraser end (tablet mode).
@@ -715,29 +992,34 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
     let s2 = st.clone();
     area.set_draw_func(move |_, cr, w, h| {
         let s = s2.borrow();
-        let (sc, ox, oy) = layout2d(w, h, s.zoom, s.pan);
+        let (iw, ih) = s.skin.dimensions();
+        let k = skin::scale(&s.skin);
+        let (sc, ox, oy) = layout2d(w, h, (iw, ih), s.zoom, s.pan);
         cr.save().ok();
         cr.translate(ox, oy);
         if s.settings.checker {
-            for y in 0..64 {
-                for x in 0..64 {
+            // One check per 64x64-layout texel, so HD skins don't draw four times as many.
+            let c = sc * k as f64;
+            for y in 0..ih / k {
+                for x in 0..iw / k {
                     let v = if (x + y) % 2 == 0 { 0.32 } else { 0.24 };
                     cr.set_source_rgb(v, v, v);
-                    cr.rectangle(x as f64 * sc, y as f64 * sc, sc, sc);
+                    cr.rectangle(x as f64 * c, y as f64 * c, c, c);
                     let _ = cr.fill();
                 }
             }
         }
         // Faint outline of every UV face, so you can see which part you are on.
         cr.set_source_rgba(1., 1., 1., 0.07);
-        for p in skin::parts(s.slim) {
-            for ov in [false, true] {
-                for f in skin::part_faces(&p, ov) {
-                    let [x, y, fw, fh] = f.rect.map(|v| v as f64 * sc);
-                    cr.rectangle(x, y, fw, fh);
-                    let _ = cr.fill();
-                }
-            }
+        let faces: Vec<[u32; 4]> = if s.cape_doc {
+            skin::cape_faces()
+        } else {
+            skin::parts(s.slim).iter().flat_map(|p| [false, true].map(|ov| skin::part_faces(p, ov).map(|f| f.rect))).flatten().collect()
+        };
+        for r in faces {
+            let [x, y, fw, fh] = r.map(|v| (v * k) as f64 * sc);
+            cr.rectangle(x, y, fw, fh);
+            let _ = cr.fill();
         }
         cr.save().ok();
         cr.scale(sc, sc);
@@ -753,12 +1035,15 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
         if s.settings.show_grid && sc >= 4. {
             set_src(cr, parse_hex(&s.settings.grid_color));
             cr.set_line_width(1.);
-            for i in 0..=64 {
+            for i in 0..=iw {
                 let v = (i as f64 * sc).round() + 0.5;
                 cr.move_to(v, 0.);
-                cr.line_to(v, 64. * sc);
+                cr.line_to(v, ih as f64 * sc);
+            }
+            for i in 0..=ih {
+                let v = (i as f64 * sc).round() + 0.5;
                 cr.move_to(0., v);
-                cr.line_to(64. * sc, v);
+                cr.line_to(iw as f64 * sc, v);
             }
             let _ = cr.stroke();
         }
@@ -781,19 +1066,20 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
         // Minimap while zoomed in.
         if s.zoom > 1. {
             let m = 96.;
+            let mh = m * ih as f64 / iw as f64;
             let (mx, my) = (w as f64 - m - 12., 12.);
             cr.set_source_rgba(0., 0., 0., 0.55);
-            cr.rectangle(mx - 4., my - 4., m + 8., m + 8.);
+            cr.rectangle(mx - 4., my - 4., m + 8., mh + 8.);
             let _ = cr.fill();
             cr.save().ok();
             cr.translate(mx, my);
-            cr.scale(m / 64., m / 64.);
+            cr.scale(m / iw as f64, m / iw as f64);
             let _ = cr.set_source_surface(surface(&s.skin), 0., 0.);
             cr.source().set_filter(cairo::Filter::Nearest);
             let _ = cr.paint();
             cr.restore().ok();
-            let k = m / (64. * sc);
-            cr.rectangle(mx + (-ox).max(0.) * k, my + (-oy).max(0.) * k, (w as f64 * k).min(m), (h as f64 * k).min(m));
+            let k = m / (iw as f64 * sc);
+            cr.rectangle(mx + (-ox).max(0.) * k, my + (-oy).max(0.) * k, (w as f64 * k).min(m), (h as f64 * k).min(mh));
             cr.set_source_rgb(1., 1., 1.);
             cr.set_line_width(1.5);
             let _ = cr.stroke();
@@ -801,7 +1087,7 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
     });
 
     let texel = |s: &State, area: &gtk::DrawingArea, x: f64, y: f64| {
-        let (sc, ox, oy) = layout2d(area.width(), area.height(), s.zoom, s.pan);
+        let (sc, ox, oy) = layout2d(area.width(), area.height(), s.skin.dimensions(), s.zoom, s.pan);
         (((x - ox) / sc).floor() as i32, ((y - oy) / sc).floor() as i32)
     };
     let drag = gtk::GestureDrag::builder().button(0).build();
@@ -813,7 +1099,7 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
         let picked = {
             let mut s = s2.borrow_mut();
             let (tx, ty) = texel(&s, &a2, x, y);
-            let inside = (0..64).contains(&tx) && (0..64).contains(&ty);
+            let inside = (0..s.skin.width() as i32).contains(&tx) && (0..s.skin.height() as i32).contains(&ty);
             if g.current_button() == 3 && s.settings.right_click_picks {
                 let tool = std::mem::replace(&mut s.tool, Tool::Picker);
                 let r = inside.then(|| s.apply(tx as u32, ty as u32)).flatten();
@@ -879,13 +1165,14 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
         let mut s = s2.borrow_mut();
         let (w, h) = (a2.width(), a2.height());
         let (mx, my) = m2.get();
-        let (sc, ox, oy) = layout2d(w, h, s.zoom, s.pan);
+        let dims = s.skin.dimensions();
+        let (sc, ox, oy) = layout2d(w, h, dims, s.zoom, s.pan);
         let (tx, ty) = ((mx - ox) / sc, (my - oy) / sc);
         s.zoom = (s.zoom * 1.25f64.powf(-dy)).clamp(1., 16.);
         if s.zoom <= 1.001 {
             (s.zoom, s.pan) = (1., (0., 0.));
         } else {
-            let (sc2, ox0, oy0) = layout2d(w, h, s.zoom, (0., 0.));
+            let (sc2, ox0, oy0) = layout2d(w, h, dims, s.zoom, (0., 0.));
             s.pan = (mx - tx * sc2 - ox0, my - ty * sc2 - oy0);
         }
         s.refresh();
@@ -899,7 +1186,8 @@ fn canvas_2d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingAre
         mouse.set((x, y));
         let s = s2.borrow();
         let (tx, ty) = texel(&s, &a2, x, y);
-        hv.set_label(&if (0..64).contains(&tx) && (0..64).contains(&ty) { describe(s.slim, tx as u32, ty as u32) } else { String::new() });
+        let inside = (0..s.skin.width() as i32).contains(&tx) && (0..s.skin.height() as i32).contains(&ty);
+        hv.set_label(&if inside { s.describe(tx as u32, ty as u32) } else { String::new() });
     });
     area.add_controller(motion);
     stylus(st, &area);
@@ -947,7 +1235,7 @@ fn view_3d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingArea 
         if s.spin && s.drag_rot.is_none() {
             s.yaw += dt * s.settings.rotate_speed as f32;
         }
-        if s.walk {
+        if s.anim > 0 {
             s.anim_t += dt * 5. * s.settings.walk_speed as f32;
         }
         s.clock += dt;
@@ -955,7 +1243,7 @@ fn view_3d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingArea 
         if !emoting {
             s.emote = None;
         }
-        if s.spin || s.walk || emoting {
+        if s.spin || s.anim > 0 || emoting {
             a.queue_draw();
         }
         glib::ControlFlow::Continue
@@ -1009,7 +1297,7 @@ fn view_3d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingArea 
     let (s2, hv) = (st.clone(), hover.clone());
     motion.connect_motion(move |_, x, y| {
         let s = s2.borrow();
-        hv.set_label(&s.pick_3d(x, y).map(|(u, v, _)| describe(s.slim, u, v)).unwrap_or_default());
+        hv.set_label(&s.pick_3d(x, y).map(|(u, v, _)| s.describe(u, v)).unwrap_or_default());
     });
     area.add_controller(motion);
     stylus(st, &area);
@@ -1017,22 +1305,20 @@ fn view_3d(st: &St, color_btn: &Picker, hover: &gtk::Label) -> gtk::DrawingArea 
 }
 
 fn palette(st: &St, color_btn: &Picker) -> gtk::DrawingArea {
-    // Two rows of 12: the 16 dye colours, then the 8 most recent colours. Swatch size is a setting.
-    const COLS: usize = 12;
-    let n = PALETTE.len() + RECENT;
+    // Two rows: the palette (16 dyes or an imported one), then the 8 most recent colours. Swatch size is a setting.
     let sw = |s: &State| s.settings.palette_size.clamp(12., 48.);
-    let size = |sw: f64| (((COLS as f64) * (sw + 3.)) as i32, (2. * (sw + 3.)) as i32);
-    let (w0, h0) = size(sw(&st.borrow()));
+    let cols = |s: &State| (palette_colors(&s.settings).len() + RECENT).div_ceil(2).max(12);
+    let size = move |s: &State| (((cols(s) as f64) * (sw(s) + 3.)) as i32, (2. * (sw(s) + 3.)) as i32);
+    let (w0, h0) = size(&st.borrow());
     let area = gtk::DrawingArea::builder().content_width(w0).content_height(h0).valign(gtk::Align::Center).build();
-    let colors = |s: &State| -> Vec<Option<[u8; 4]>> {
-        PALETTE.iter().map(|c| Some([(c >> 16) as u8, (c >> 8) as u8, *c as u8, 255])).chain((0..RECENT).map(|i| s.recent.get(i).copied())).collect()
-    };
+    let colors = |s: &State| -> Vec<Option<[u8; 4]>> { palette_colors(&s.settings).into_iter().map(Some).chain((0..RECENT).map(|i| s.recent.get(i).copied())).collect() };
     let s2 = st.clone();
     area.set_draw_func(move |a, cr, _, _| {
         let s = s2.borrow();
         let swz = sw(&s);
         let step = swz + 3.;
-        let (w, h) = size(swz);
+        let (w, h) = size(&s);
+        let n = cols(&s);
         if a.content_width() != w || a.content_height() != h {
             let a = a.clone();
             glib::idle_add_local_once(move || {
@@ -1040,8 +1326,8 @@ fn palette(st: &St, color_btn: &Picker) -> gtk::DrawingArea {
                 a.set_content_height(h);
             });
         }
-        for (i, c) in colors(&s).into_iter().enumerate().take(n) {
-            let (x, y) = ((i % COLS) as f64 * step, (i / COLS) as f64 * step);
+        for (i, c) in colors(&s).into_iter().enumerate() {
+            let (x, y) = ((i % n) as f64 * step, (i / n) as f64 * step);
             cr.new_sub_path();
             cr.arc(x + swz / 2., y + swz / 2., swz / 2. - 1., 0., std::f64::consts::TAU);
             match c {
@@ -1060,7 +1346,7 @@ fn palette(st: &St, color_btn: &Picker) -> gtk::DrawingArea {
     let (s2, b2) = (st.clone(), color_btn.clone());
     click.connect_pressed(move |_, _, x, y| {
         let step = sw(&s2.borrow()) + 3.;
-        let i = (y / step) as usize * COLS + (x / step) as usize;
+        let i = (y / step) as usize * cols(&s2.borrow()) + (x / step) as usize;
         let c = colors(&s2.borrow()).get(i).copied().flatten();
         if let Some(c) = c {
             s2.borrow_mut().color = c;
@@ -1177,7 +1463,13 @@ fn tools_menu() -> gtk::MenuButton {
     tools.append(Some(t("check_skin")), Some("app.check"));
     tools.append(Some(t("from_picture")), Some("app.picture"));
     tools.append(Some(t("timelapse")), Some("app.timelapse"));
+    tools.append(Some(t("hd_toggle")), Some("app.hd"));
     m.append_section(None, &tools);
+    let pal = gio::Menu::new();
+    pal.append(Some(t("palette_import")), Some("app.palette-import"));
+    pal.append(Some(t("palette_reset")), Some("app.palette-reset"));
+    pal.append(Some(t("palette_lock")), Some("app.palette-lock"));
+    m.append_section(Some(t("palettes")), &pal);
     let sel = gio::Menu::new();
     sel.append(Some(t("sel_copy")), Some("app.sel-copy"));
     sel.append(Some(t("sel_paste")), Some("app.sel-paste"));
@@ -1263,6 +1555,16 @@ fn view_extras(st: &St) -> gtk::Box {
     b.append(&dropdown(&items, s.item as u32, st, |s, v| s.item = v as usize));
     let armors: Vec<&str> = tools::ARMORS.iter().map(|a| t(a.0)).collect();
     b.append(&dropdown(&armors, s.armor as u32, st, |s, v| s.armor = v as usize));
+    b.append(&heading(t("cape")));
+    let cape = dropdown(&[t("cape_none"), t("cape"), t("elytra")], s.cape_mode, st, |s, v| s.cape_mode = v);
+    b.append(&cape);
+    let capes = gtk::Box::builder().css_classes(["linked"]).build();
+    for (key, action) in [("cape_file", "app.cape-file"), ("cape_nick", "app.cape-nick"), ("cape_edit", "app.cape-edit")] {
+        let btn = gtk::Button::with_label(t(key));
+        btn.set_action_name(Some(action));
+        capes.append(&btn);
+    }
+    b.append(&capes);
     b.append(&heading(t("compare")));
     // Tab list changes, so the choices are rebuilt each time the menu opens.
     let cmp = gtk::DropDown::from_strings(&[t("compare_none")]);
@@ -1322,7 +1624,318 @@ fn view_extras(st: &St) -> gtk::Box {
         rec.append(&btn);
     }
     b.append(&rec);
+    drop(s);
+    // Loading a cape switches it on; keep the dropdown in step.
+    st.borrow_mut().listeners.push(Box::new(move |s| {
+        if cape.selected() != s.cape_mode {
+            let (c, m) = (cape.clone(), s.cape_mode);
+            glib::idle_add_local_once(move || c.set_selected(m));
+        }
+    }));
     b
+}
+
+fn padded(b: &gtk::Box) {
+    b.set_margin_start(8);
+    b.set_margin_end(8);
+    b.set_margin_top(8);
+    b.set_margin_bottom(8);
+}
+
+/// Draws `img` fitted and centred in a w x h box, pixel-crisp.
+fn paint_image(cr: &cairo::Context, img: &RgbaImage, x: f64, y: f64, w: f64, h: f64) {
+    let sc = (w / img.width() as f64).min(h / img.height() as f64);
+    cr.save().ok();
+    cr.translate(x + ((w - img.width() as f64 * sc) / 2.).floor(), y + ((h - img.height() as f64 * sc) / 2.).floor());
+    cr.scale(sc, sc);
+    let _ = cr.set_source_surface(surface(img), 0., 0.);
+    cr.source().set_filter(cairo::Filter::Nearest);
+    let _ = cr.paint();
+    cr.restore().ok();
+}
+
+/// Sticker picker next to the sticker tool; choosing one switches to that tool.
+fn sticker_button(st: &St, stamp: &gtk::ToggleButton) -> gtk::MenuButton {
+    let grid = gtk::Grid::builder().row_spacing(4).column_spacing(4).margin_start(8).margin_end(8).margin_top(8).margin_bottom(8).build();
+    let pop = gtk::Popover::builder().child(&grid).build();
+    for (i, (key, _)) in tools::STICKERS.iter().enumerate() {
+        let area = gtk::DrawingArea::builder().content_width(40).content_height(40).build();
+        let s2 = st.clone();
+        area.set_draw_func(move |_, cr, w, h| paint_image(cr, &tools::sticker(i, s2.borrow().color, 1), 4., 4., w as f64 - 8., h as f64 - 8.));
+        let b = gtk::Button::builder().child(&area).tooltip_text(t(key)).css_classes(["flat"]).build();
+        let (s2, b2, p2) = (st.clone(), stamp.clone(), pop.clone());
+        b.connect_clicked(move |_| {
+            s2.borrow_mut().sticker = i;
+            b2.set_active(true);
+            p2.popdown();
+        });
+        grid.attach(&b, (i % 4) as i32, (i / 4) as i32, 1, 1);
+    }
+    gtk::MenuButton::builder().tooltip_text(t("stickers")).popover(&pop).valign(gtk::Align::Center).build()
+}
+
+/// Layers popover: pick, show/hide, add, delete, reorder, merge down.
+fn layers_button(st: &St) -> gtk::MenuButton {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    padded(&b);
+    b.set_width_request(240);
+    b.append(&heading(t("layers")));
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    b.append(&rows);
+    let bar = gtk::Box::builder().css_classes(["linked"]).halign(gtk::Align::Center).build();
+    let ops: [(&str, &str, fn(&mut State)); 5] = [
+        ("list-add-symbolic", "layer_add", State::layer_add),
+        ("list-remove-symbolic", "layer_del", State::layer_delete),
+        ("go-up-symbolic", "layer_up", |s| s.layer_move(true)),
+        ("go-down-symbolic", "layer_down", |s| s.layer_move(false)),
+        ("go-bottom-symbolic", "layer_merge", State::layer_merge_down),
+    ];
+    for (icon, tip, f) in ops {
+        let btn = gtk::Button::builder().icon_name(icon).tooltip_text(t(tip)).build();
+        let s2 = st.clone();
+        btn.connect_clicked(move |_| f(&mut s2.borrow_mut()));
+        bar.append(&btn);
+    }
+    b.append(&bar);
+    b.append(&gtk::Label::builder().label(t("layers_tip")).wrap(true).max_width_chars(28).xalign(0.).css_classes(["dim-label", "caption"]).build());
+    // Rows are rebuilt only when the layer list itself changes, not on every brush stroke.
+    let sig: Rc<RefCell<String>> = Rc::default();
+    let s0 = st.clone();
+    let fill = move |s: &State| {
+        let now = format!("{}|{}", s.layer, s.layers.iter().map(|l| format!("{}{}", l.name, l.visible)).collect::<Vec<_>>().join("|"));
+        if *sig.borrow() == now {
+            return;
+        }
+        *sig.borrow_mut() = now;
+        while let Some(c) = rows.first_child() {
+            rows.remove(&c);
+        }
+        if s.layers.is_empty() {
+            rows.append(&gtk::Label::builder().label(format!("{} 1", t("layer"))).xalign(0.).margin_start(8).build());
+        }
+        for (i, l) in s.layers.iter().enumerate().rev() {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let eye = gtk::CheckButton::builder().active(l.visible).build();
+            let s2 = s0.clone();
+            // Deferred: we're inside a listener while the state is borrowed.
+            eye.connect_toggled(move |_| {
+                let s3 = s2.clone();
+                glib::idle_add_local_once(move || s3.borrow_mut().layer_toggle(i));
+            });
+            let name = gtk::ToggleButton::builder().label(&l.name).active(i == s.layer).hexpand(true).css_classes(["flat"]).build();
+            let s2 = s0.clone();
+            name.connect_clicked(move |_| {
+                let s3 = s2.clone();
+                glib::idle_add_local_once(move || s3.borrow_mut().layer_select(i));
+            });
+            row.append(&eye);
+            row.append(&name);
+            rows.append(&row);
+        }
+    };
+    fill(&st.borrow());
+    st.borrow_mut().listeners.push(Box::new(fill));
+    gtk::MenuButton::builder().icon_name("view-paged-symbolic").tooltip_text(t("layers")).popover(&gtk::Popover::builder().child(&b).build()).valign(gtk::Align::Center).build()
+}
+
+/// Pose editor: ready-made and saved poses, rotation sliders per part.
+fn pose_button(st: &St) -> gtk::MenuButton {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    padded(&b);
+    b.set_width_request(280);
+    b.append(&heading(t("pose")));
+    let presets = gtk::DropDown::from_strings(&[t("pose_choose")]);
+    b.append(&presets);
+    let part = gtk::DropDown::from_strings(&PARTS.map(t));
+    b.append(&part);
+    let sliders: Vec<gtk::Scale> = ["X", "Y", "Z"]
+        .iter()
+        .map(|axis| {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            row.append(&gtk::Label::new(Some(axis)));
+            let sc = gtk::Scale::with_range(gtk::Orientation::Horizontal, -180., 180., 1.);
+            sc.set_hexpand(true);
+            sc.set_draw_value(true);
+            row.append(&sc);
+            b.append(&row);
+            sc
+        })
+        .collect();
+    let syncing = Rc::new(std::cell::Cell::new(false));
+    // Sliders show the chosen part's rotation in degrees.
+    let sync = {
+        let (st, part, sliders, syncing) = (st.clone(), part.clone(), sliders.clone(), syncing.clone());
+        Rc::new(move || {
+            let r = st.borrow().pose[part.selected() as usize];
+            syncing.set(true);
+            for (sc, v) in sliders.iter().zip(r) {
+                sc.set_value(v.to_degrees() as f64);
+            }
+            syncing.set(false);
+        })
+    };
+    for (axis, sc) in sliders.iter().enumerate() {
+        let (s2, p2, sy) = (st.clone(), part.clone(), syncing.clone());
+        sc.connect_value_changed(move |sc| {
+            if !sy.get() {
+                let mut s = s2.borrow_mut();
+                s.pose[p2.selected() as usize][axis] = (sc.value() as f32).to_radians();
+                s.refresh();
+            }
+        });
+    }
+    let sy = sync.clone();
+    part.connect_selected_notify(move |_| sy());
+    let builtin = render::POSES.len() as u32;
+    let (s2, sy) = (st.clone(), sync.clone());
+    presets.connect_selected_notify(move |d| {
+        let i = d.selected();
+        let pose = {
+            let s = s2.borrow();
+            match i {
+                0 => None,
+                i if i <= builtin => Some(render::POSES[i as usize - 1].1),
+                i => s.settings.poses.get((i - builtin - 1) as usize).map(|p| p.1),
+            }
+        };
+        if let Some(p) = pose {
+            let mut s = s2.borrow_mut();
+            s.pose = p;
+            s.refresh();
+            drop(s);
+            sy();
+        }
+    });
+    // Built-in names, then the saved poses; rebuilt whenever the popover opens or a pose is saved/deleted.
+    let refill = {
+        let (st, presets) = (st.clone(), presets.clone());
+        Rc::new(move || {
+            let mut names: Vec<String> = std::iter::once(t("pose_choose")).chain(render::POSES.iter().map(|p| t(p.0))).map(String::from).collect();
+            names.extend(st.borrow().settings.poses.iter().map(|p| p.0.clone()));
+            let refs: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+            presets.set_model(Some(&gtk::StringList::new(&refs)));
+            presets.set_selected(0);
+        })
+    };
+    let reset = gtk::Button::with_label(t("pose_reset"));
+    let (s2, sy) = (st.clone(), sync.clone());
+    reset.connect_clicked(move |_| {
+        let mut s = s2.borrow_mut();
+        s.pose = [[0.; 3]; 6];
+        s.refresh();
+        drop(s);
+        sy();
+    });
+    b.append(&reset);
+    let save_row = gtk::Box::builder().css_classes(["linked"]).build();
+    let name = gtk::Entry::builder().placeholder_text(t("pose_name")).hexpand(true).build();
+    let save = gtk::Button::builder().icon_name("document-save-symbolic").tooltip_text(t("pose_save")).build();
+    let del = gtk::Button::builder().icon_name("user-trash-symbolic").tooltip_text(t("delete")).build();
+    let (s2, n2, rf) = (st.clone(), name.clone(), refill.clone());
+    save.connect_clicked(move |_| {
+        let mut s = s2.borrow_mut();
+        let typed = n2.text().trim().to_string();
+        let label = if typed.is_empty() { format!("{} {}", t("pose"), s.settings.poses.len() + 1) } else { typed };
+        let pose = s.pose;
+        s.settings.poses.push((label, pose));
+        s.settings.save();
+        drop(s);
+        n2.set_text("");
+        rf();
+    });
+    let (s2, p2, rf) = (st.clone(), presets.clone(), refill.clone());
+    del.connect_clicked(move |_| {
+        // Only saved poses can be deleted, the built-in ones stay.
+        let Some(i) = p2.selected().checked_sub(builtin + 1) else { return };
+        let mut s = s2.borrow_mut();
+        if (i as usize) < s.settings.poses.len() {
+            s.settings.poses.remove(i as usize);
+            s.settings.save();
+        }
+        drop(s);
+        rf();
+    });
+    save_row.append(&name);
+    save_row.append(&save);
+    save_row.append(&del);
+    b.append(&save_row);
+    let pop = gtk::Popover::builder().child(&b).build();
+    pop.connect_show(move |_| {
+        refill();
+        sync();
+    });
+    gtk::MenuButton::builder().icon_name("avatar-default-symbolic").tooltip_text(t("pose")).popover(&pop).build()
+}
+
+/// "How it looks from afar": the model at 64, 32 and 16 px with a name tag, and the head as in the player list.
+fn distance_button(st: &St) -> gtk::MenuButton {
+    let area = gtk::DrawingArea::builder().content_width(424).content_height(250).build();
+    let nick: Rc<RefCell<String>> = Rc::default();
+    let (s2, n2) = (st.clone(), nick.clone());
+    area.set_draw_func(move |_, cr, _, _| {
+        let s = s2.borrow();
+        let name = n2.borrow().clone();
+        let tag = |cr: &cairo::Context, cx: f64, bottom: f64, size: f64| {
+            cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+            cr.set_font_size(size);
+            let Ok(e) = cr.text_extents(&name) else { return };
+            let (w, h) = (e.x_advance() + 6., size + 4.);
+            cr.set_source_rgba(0., 0., 0., 0.35);
+            cr.rectangle(cx - w / 2., bottom - h, w, h);
+            let _ = cr.fill();
+            cr.set_source_rgb(1., 1., 1.);
+            cr.move_to(cx - w / 2. + 3., bottom - 4.);
+            let _ = cr.show_text(&name);
+        };
+        // Camera distance at which the 32-unit model fills ~90 % of the frame height, whatever the FOV.
+        let dist = 18. / (s.settings.fov as f32 / 2.).to_radians().tan();
+        let (yaw, t0) = s.anim_state();
+        for (i, px) in [64usize, 32, 16].into_iter().enumerate() {
+            let fr = s.render_view_at(px, px, yaw, t0, None, true, dist);
+            let img = crate::dialogs::frame_to_image(&fr.color, px as u32, px as u32);
+            let x = 8. + i as f64 * 140.;
+            paint_image(cr, &img, x, 28., 128., 128.);
+            tag(cr, x + 64., 28. + 128. / 18., 11.);
+            cr.set_source_rgba(0.6, 0.6, 0.6, 1.);
+            cr.set_font_size(11.);
+            cr.move_to(x + 48., 172.);
+            let _ = cr.show_text(&format!("{px} px"));
+        }
+        // Player list (Tab): the face with its hat layer, then the name.
+        let face = {
+            let img = if s.cape_doc { &s.wearer.0 } else { &s.skin };
+            let k = skin::scale(img);
+            let mut f = tools::crop(img, [8 * k, 8 * k, 8 * k, 8 * k]);
+            image::imageops::overlay(&mut f, &tools::crop(img, [40 * k, 8 * k, 8 * k, 8 * k]), 0, 0);
+            f
+        };
+        cr.set_source_rgba(0.6, 0.6, 0.6, 1.);
+        cr.move_to(8., 200.);
+        let _ = cr.show_text(t("tab_list"));
+        cr.set_source_rgba(0., 0., 0., 0.45);
+        cr.rectangle(8., 208., 260., 32.);
+        let _ = cr.fill();
+        paint_image(cr, &face, 12., 212., 24., 24.);
+        cr.set_source_rgb(1., 1., 1.);
+        cr.set_font_size(15.);
+        cr.move_to(44., 229.);
+        let _ = cr.show_text(&name);
+    });
+    let a = area.clone();
+    st.borrow_mut().listeners.push(Box::new(move |_| a.queue_draw()));
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    padded(&b);
+    b.append(&heading(t("distance")));
+    b.append(&area);
+    let pop = gtk::Popover::builder().child(&b).build();
+    let s2 = st.clone();
+    pop.connect_show(move |_| {
+        // Signed-in Ely.by name if there is one, else the file name.
+        let s = s2.borrow();
+        let file = s.file.as_ref().and_then(|f| f.file_stem()).map(|n| n.to_string_lossy().into_owned());
+        *nick.borrow_mut() = crate::library::Account::load().map(|a| a.name).filter(|n| !n.is_empty()).or(file).unwrap_or_else(|| "Steve".into());
+    });
+    gtk::MenuButton::builder().icon_name("zoom-out-symbolic").tooltip_text(t("distance")).popover(&pop).build()
 }
 
 /// Tab strip; rebuilt only when titles or the active tab change.
@@ -1397,6 +2010,7 @@ pub fn page(st: &St) -> gtk::Widget {
     let tools_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     tools_box.add_css_class("linked");
     let mut first: Option<gtk::ToggleButton> = None;
+    let mut stamp_btn = None;
     let cur = st.borrow().tool;
     for (tool, icon, tip) in [
         (Tool::Pencil, "document-edit-symbolic", "pencil"),
@@ -1405,10 +2019,14 @@ pub fn page(st: &St) -> gtk::Widget {
         (Tool::Picker, "color-select-symbolic", "picker"),
         (Tool::Replace, "edit-find-replace-symbolic", "replace_tool"),
         (Tool::Select, "edit-select-symbolic", "select_tool"),
+        (Tool::Stamp, "face-smile-symbolic", "stamp_tool"),
     ] {
         let b = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(t(tip)).active(tool == cur).build();
         b.set_group(first.as_ref());
         first.get_or_insert(b.clone());
+        if tool == Tool::Stamp {
+            stamp_btn = Some(b.clone());
+        }
         let s2 = st.clone();
         b.connect_toggled(move |b| {
             if b.is_active() {
@@ -1422,7 +2040,9 @@ pub fn page(st: &St) -> gtk::Widget {
         });
         tools_box.append(&b);
     }
+    tools_box.append(&sticker_button(st, &stamp_btn.unwrap()));
     bar.append(&tools_box);
+    bar.append(&layers_button(st));
 
     // Brush size + shape.
     let size = gtk::SpinButton::with_range(1., 8., 1.);
@@ -1455,6 +2075,8 @@ pub fn page(st: &St) -> gtk::Widget {
         p.queue_draw();
     }));
 
+    // Built before the borrow below: they register listeners.
+    let (pose_btn, dist_btn, extras) = (pose_button(st), distance_button(st), view_extras(st));
     let s = st.borrow();
     // Floating bar over the 3D view: main toggles + a menu with the rest.
     let bar3d = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1464,6 +2086,8 @@ pub fn page(st: &St) -> gtk::Widget {
     bar3d.set_margin_bottom(12);
     bar3d.append(&toggle(t("layers3d"), Some(t("layers3d_tip")), s.voxels, st, |s, v| s.voxels = v));
     bar3d.append(&toggle(t("paint3d"), Some(t("paint3d_tip")), s.paint3d, st, |s, v| s.paint3d = v));
+    bar3d.append(&pose_btn);
+    bar3d.append(&dist_btn);
     let menu = gtk::Box::new(gtk::Orientation::Vertical, 6);
     menu.set_margin_start(6);
     menu.set_margin_end(6);
@@ -1474,8 +2098,12 @@ pub fn page(st: &St) -> gtk::Widget {
     let po = check(t("paint_overlay"), s.paint_overlay, st, |s, v| s.paint_overlay = v);
     po.set_tooltip_text(Some(t("paint_overlay_tip")));
     menu.append(&po);
-    menu.append(&check(t("walk"), s.walk, st, |s, v| s.walk = v));
     menu.append(&check(t("rotate"), s.spin, st, |s, v| s.spin = v));
+    menu.append(&heading(t("animation")));
+    menu.append(&dropdown(&render::ANIMS.map(t), s.anim as u32, st, |s, v| s.anim = v as usize));
+    menu.append(&heading(t("solo")));
+    let parts: Vec<&str> = std::iter::once(t("all")).chain(PARTS.map(t)).collect();
+    menu.append(&dropdown(&parts, s.solo.map_or(0, |i| i as u32 + 1), st, |s, v| s.solo = v.checked_sub(1).map(|i| i as usize)));
     let model = gtk::DropDown::from_strings(&[t("classic"), t("slim")]);
     model.set_selected(s.slim as u32);
     let s2 = st.clone();
@@ -1498,7 +2126,6 @@ pub fn page(st: &St) -> gtk::Widget {
     let cols = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     cols.append(&menu);
     cols.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    let extras = view_extras(st);
     extras.set_margin_top(6);
     extras.set_margin_bottom(6);
     extras.set_margin_end(6);
@@ -1639,6 +2266,70 @@ mod tests {
         assert_eq!(s.skin.get_pixel(2, 2).0, [5, 5, 5, 255]);
     }
 
+    #[test]
+    fn layers_paint_merge_and_undo() {
+        let mut s = State::new(Settings::default());
+        let base = s.skin.get_pixel(12, 12).0;
+        s.layer_add();
+        assert_eq!((s.layers.len(), s.layer), (2, 1));
+        s.color = [9, 9, 9, 255];
+        s.begin();
+        s.apply(12, 12);
+        assert_eq!(s.skin.get_pixel(12, 12).0, [9, 9, 9, 255]); // merged view
+        assert_eq!(s.layers[0].img.get_pixel(12, 12).0, base); // base layer untouched
+        s.layer_toggle(1);
+        assert_eq!(s.skin.get_pixel(12, 12).0, base); // hidden
+        s.undo();
+        assert_eq!(s.skin.get_pixel(12, 12).0, [9, 9, 9, 255]);
+        s.layer_merge_down();
+        assert!(s.layers.is_empty()); // back to a plain skin
+        assert_eq!(s.skin.get_pixel(12, 12).0, [9, 9, 9, 255]);
+        s.undo();
+        s.undo();
+        s.undo();
+        assert!(s.layers.is_empty() && s.skin.get_pixel(12, 12).0 == base);
+    }
+
+    #[test]
+    fn hd_stamp_and_palette_lock() {
+        let mut s = State::new(Settings::default());
+        s.toggle_hd();
+        assert_eq!(s.skin.dimensions(), (128, 128));
+        s.tool = Tool::Stamp;
+        s.sticker = 0; // eyes: 6x1, so 12x2 in HD
+        s.color = [1, 2, 3, 255];
+        s.begin();
+        s.apply(31, 24); // head front, HD
+        assert_eq!(s.skin.get_pixel(27, 24).0, [1, 2, 3, 255]);
+        s.apply(17, 24); // left edge: the part off the face is clipped, the side face stays as is
+        assert_ne!(s.skin.get_pixel(15, 24).0, [245, 245, 245, 255]);
+        s.settings.palette_lock = true;
+        s.tool = Tool::Pencil;
+        s.color = [180, 40, 30, 255];
+        s.apply(40, 40);
+        assert_eq!(s.skin.get_pixel(40, 40).0, [0xB0, 0x2E, 0x26, 255]); // red dye
+        s.undo();
+        s.toggle_hd();
+        assert_eq!(s.skin.dimensions(), (64, 64));
+    }
+
+    #[test]
+    fn cape_tab_paints_the_cape() {
+        let mut s = State::new(Settings::default());
+        s.mark_dirty();
+        s.open_cape(tools::plain_cape([50, 50, 200, 255]), None);
+        assert!(s.cape_doc && s.cape_mode == 1 && s.skin.dimensions() == (64, 32));
+        s.color = [9, 9, 9, 255];
+        s.brush = 3;
+        s.begin();
+        s.apply(1, 5); // cape outside, left edge: the brush stays on that face
+        assert_eq!(s.skin.get_pixel(1, 5).0, [9, 9, 9, 255]);
+        assert_ne!(s.skin.get_pixel(0, 5).0, [9, 9, 9, 255]);
+        s.switch_tab(0);
+        assert_eq!(s.cape.as_ref().unwrap().get_pixel(1, 5).0, [9, 9, 9, 255]); // the skin wears it
+        assert!(s.render_view(64, 64, 3.1, 0., None, false).pick.iter().all(|&p| p == 0 || ((p - 1) >> 10 & 1023) < 64));
+    }
+
     /// Dev helper: OUT=dir cargo test scene_dump -- --ignored
     #[test]
     #[ignore]
@@ -1651,6 +2342,15 @@ mod tests {
             (s.scene, s.item, s.armor, s.explode) = (scene, item, armor, ex);
             let yaw = if scene == 1 { std::f32::consts::PI - 0.5 } else { 0.6 };
             let fr = s.render_view(400, 400, yaw, 0., None, false);
+            crate::dialogs::frame_to_image(&fr.color, 400, 400).save(format!("{out}/{name}.png")).unwrap();
+        }
+        // Cape, elytra and the looping animations, seen from behind-left.
+        (s.scene, s.item, s.armor, s.explode) = (0, 0, 0, 0.);
+        s.cape = Some(tools::plain_cape([160, 30, 40, 255]));
+        let shots: [(&str, u32, usize, f32); 5] = [("cape", 1, 0, 2.4), ("elytra", 2, 0, 2.4), ("sneak", 1, 3, 1.9), ("swim", 0, 4, 0.9), ("sleep", 0, 6, 0.6)];
+        for (name, cape, anim, yaw) in shots {
+            (s.cape_mode, s.anim) = (cape, anim);
+            let fr = s.render_view(400, 400, yaw, 1., None, false);
             crate::dialogs::frame_to_image(&fr.color, 400, 400).save(format!("{out}/{name}.png")).unwrap();
         }
         crate::packs::panorama(&s.skin, false)[0].save(format!("{out}/pano0.png")).unwrap();

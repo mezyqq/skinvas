@@ -10,8 +10,9 @@ use std::{path::PathBuf, rc::Rc};
 const PART_GROUPS: [(&str, &[usize]); 5] = [("whole_skin", &[]), ("part_head", &[skin::HEAD]), ("part_body", &[skin::BODY]), ("arms", &[skin::RARM, skin::LARM]), ("legs", &[skin::RLEG, skin::LLEG])];
 
 /// A dialog that previews its result on the live skin; Cancel restores, Apply records one undo step.
+/// Works on the active layer (the whole skin when there are no layers).
 fn live_dialog(ctx: &Rc<AppCtx>, heading: &str, body: Option<&str>, extra: &impl IsA<gtk::Widget>) -> (adw::AlertDialog, Rc<dyn Fn(RgbaImage)>, RgbaImage) {
-    let orig = ctx.st.borrow().skin.clone();
+    let orig = ctx.st.borrow().canvas_ref().clone();
     let d = adw::AlertDialog::new(Some(heading), body);
     d.set_extra_child(Some(extra));
     d.add_responses(&[("cancel", t("cancel")), ("apply", t("apply"))]);
@@ -20,17 +21,19 @@ fn live_dialog(ctx: &Rc<AppCtx>, heading: &str, body: Option<&str>, extra: &impl
     let st = ctx.st.clone();
     let preview: Rc<dyn Fn(RgbaImage)> = Rc::new(move |img| {
         let mut s = st.borrow_mut();
-        s.skin = img;
+        *s.canvas() = img;
+        s.compose();
         s.refresh();
     });
     let (st, o) = (ctx.st.clone(), orig.clone());
     d.connect_response(None, move |_, r| {
         let mut s = st.borrow_mut();
-        let new = std::mem::replace(&mut s.skin, o.clone());
+        let new = std::mem::replace(s.canvas(), o.clone());
         if r == "apply" && new != o {
             s.checkpoint();
-            s.skin = new;
+            *s.canvas() = new;
         }
+        s.compose();
         s.refresh();
     });
     (d, preview, orig)
@@ -72,7 +75,7 @@ fn adjust(ctx: &Rc<AppCtx>) {
 }
 
 fn quantize(ctx: &Rc<AppCtx>) {
-    let have = tools::count_colors(&ctx.st.borrow().skin);
+    let have = tools::count_colors(ctx.st.borrow().canvas_ref());
     let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
     let n = gtk::SpinButton::with_range(2., 64., 1.);
     n.set_value(16f64.min(have as f64));
@@ -92,6 +95,8 @@ fn transfer(ctx: &Rc<AppCtx>) {
             Ok(i) => i,
             Err(e) => return c.toast(&format!("{}: {e}", t("error"))),
         };
+        let (w, h) = c.st.borrow().skin.dimensions();
+        let src = skin::fit(&src, w, h);
         let b = gtk::Box::new(gtk::Orientation::Vertical, 4);
         let checks: Vec<(gtk::CheckButton, usize)> = ["part_head", "part_body", "part_rarm", "part_larm", "part_rleg", "part_lleg"]
             .iter()
@@ -146,8 +151,10 @@ fn check(ctx: &Rc<AppCtx>) {
     let st = ctx.st.clone();
     d.connect_response(None, move |_, r| {
         if r == "fix" {
+            // The issues are about the merged skin, so fixing flattens the layers (one undo step).
             let mut s = st.borrow_mut();
             s.checkpoint();
+            s.flatten();
             tools::fix(&mut s.skin, slim);
             s.refresh();
         }
@@ -324,7 +331,8 @@ fn mineskin(ctx: &Rc<AppCtx>) {
     let (png, slim, name) = {
         let s = ctx.st.borrow();
         let mut b = std::io::Cursor::new(Vec::new());
-        let _ = s.skin.write_to(&mut b, image::ImageFormat::Png);
+        // MineSkin only takes 64x64.
+        let _ = skin::fit(&s.skin, 64, 64).write_to(&mut b, image::ImageFormat::Png);
         (b.into_inner(), s.slim, s.title().trim_end_matches(" •").trim_end_matches(".png").to_string())
     };
     ctx.toast(t("uploading"));
@@ -359,14 +367,15 @@ fn run_plugin(ctx: &Rc<AppCtx>, path: &str) {
     };
     let r = {
         let s = ctx.st.borrow();
-        crate::plugins::run(&src, &s.skin, s.slim)
+        crate::plugins::run(&src, s.canvas_ref(), s.slim)
     };
     match r {
         Ok(img) => {
             let mut s = ctx.st.borrow_mut();
-            if img != s.skin {
+            if img != *s.canvas_ref() {
                 s.checkpoint();
-                s.skin = img;
+                *s.canvas() = img;
+                s.compose();
                 s.refresh();
             }
         }
@@ -374,8 +383,100 @@ fn run_plugin(ctx: &Rc<AppCtx>, path: &str) {
     }
 }
 
+fn image_filter(name: &str, patterns: &[&str]) -> gio::ListStore {
+    let f = gtk::FileFilter::new();
+    f.set_name(Some(name));
+    for p in patterns {
+        f.add_pattern(p);
+    }
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&f);
+    filters
+}
+
+/// Lospec/GIMP/Paint.NET palette file -> the toolbar palette.
+fn palette_import(ctx: &Rc<AppCtx>) {
+    let c = ctx.clone();
+    let filters = image_filter(t("palettes"), &["*.gpl", "*.hex", "*.txt"]);
+    gtk::FileDialog::builder().modal(true).filters(&filters).build().open(Some(&ctx.win), None::<&gio::Cancellable>, move |r| {
+        let Some(p) = r.ok().and_then(|f| f.path()) else { return };
+        let cols = std::fs::read_to_string(&p).map(|s| tools::parse_palette(&s)).unwrap_or_default();
+        if cols.is_empty() {
+            return c.toast(t("palette_bad"));
+        }
+        let mut s = c.st.borrow_mut();
+        s.settings.palette = cols.into_iter().map(crate::settings::to_hex).collect();
+        s.settings.save();
+        s.refresh();
+    });
+}
+
+/// Puts on a cape (and shows it if it was hidden).
+fn wear_cape(ctx: &Rc<AppCtx>, png: &[u8]) {
+    match skin::load_cape(png) {
+        Ok(img) => {
+            let mut s = ctx.st.borrow_mut();
+            s.cape = Some(img);
+            s.cape_mode = s.cape_mode.max(1);
+            s.refresh();
+        }
+        Err(d) => ctx.toast(&format!("{} {d}", t("cape_bad"))),
+    }
+}
+
+fn cape_file(ctx: &Rc<AppCtx>) {
+    let c = ctx.clone();
+    ctx.png_dialog().open(Some(&ctx.win), None::<&gio::Cancellable>, move |r| {
+        let Some(p) = r.ok().and_then(|f| f.path()) else { return };
+        match std::fs::read(&p) {
+            Ok(b) => wear_cape(&c, &b),
+            Err(e) => c.toast(&format!("{}: {e}", t("error"))),
+        }
+    });
+}
+
+fn cape_nick(ctx: &Rc<AppCtx>) {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    let entry = gtk::Entry::builder().placeholder_text(t("nick")).activates_default(true).build();
+    let src = gtk::DropDown::from_strings(&["Mojang", "Ely.by", "OptiFine"]);
+    b.append(&entry);
+    b.append(&src);
+    let d = adw::AlertDialog::new(Some(t("cape")), None);
+    d.set_extra_child(Some(&b));
+    d.add_responses(&[("cancel", t("cancel")), ("load", t("load"))]);
+    d.set_response_appearance("load", adw::ResponseAppearance::Suggested);
+    d.set_default_response(Some("load"));
+    let c = ctx.clone();
+    d.connect_response(None, move |_, r| {
+        let name = entry.text().trim().to_string();
+        if r != "load" || name.is_empty() {
+            return;
+        }
+        let (c2, which) = (c.clone(), src.selected());
+        crate::browser::fetch(
+            move || crate::net::cape(which, &name),
+            move |r| match r {
+                Ok(Some(png)) => wear_cape(&c2, &png),
+                Ok(None) => c2.toast(t("cape_none_found")),
+                Err(e) => c2.toast(&format!("{}: {e}", t("error"))),
+            },
+        );
+    });
+    d.present(Some(&ctx.win));
+}
+
 pub fn actions(app: &adw::Application, ctx: &Rc<AppCtx>) {
-    let plain: [(&str, fn(&Rc<AppCtx>)); 16] = [
+    let plain: [(&str, fn(&Rc<AppCtx>)); 21] = [
+        ("palette-import", palette_import),
+        ("palette-reset", |c| {
+            let mut s = c.st.borrow_mut();
+            s.settings.palette.clear();
+            s.settings.save();
+            s.refresh();
+        }),
+        ("hd", |c| c.st.borrow_mut().toggle_hd()),
+        ("cape-file", cape_file),
+        ("cape-nick", cape_nick),
         ("picture", picture),
         ("timelapse", timelapse),
         ("mineskin", mineskin),
@@ -400,12 +501,36 @@ pub fn actions(app: &adw::Application, ctx: &Rc<AppCtx>) {
         ("sel-flip", |c| c.st.borrow_mut().sel_transform(tools::flip_h)),
         ("sel-delete", |c| c.st.borrow_mut().sel_delete()),
     ];
+    // Tools that expect the skin layout refuse to run on a cape tab.
+    const SKIN_ONLY: [&str; 5] = ["picture", "timelapse", "mineskin", "transfer", "check"];
     for (name, f) in plain {
         let a = gio::SimpleAction::new(name, None);
         let c = ctx.clone();
-        a.connect_activate(move |_, _| f(&c));
+        let guarded = SKIN_ONLY.contains(&name);
+        a.connect_activate(move |_, _| if guarded && c.st.borrow().cape_doc { c.toast(t("skin_only")) } else { f(&c) });
         app.add_action(&a);
     }
+    let a = gio::SimpleAction::new("cape-edit", None);
+    let c = ctx.clone();
+    a.connect_activate(move |_, _| {
+        let mut s = c.st.borrow_mut();
+        let img = s.cape.clone().unwrap_or_else(|| tools::plain_cape(s.color));
+        s.open_cape(img, None);
+        drop(s);
+        c.go("editor");
+    });
+    app.add_action(&a);
+    let lock = ctx.st.borrow().settings.palette_lock;
+    let a = gio::SimpleAction::new_stateful("palette-lock", None, &lock.to_variant());
+    let c = ctx.clone();
+    a.connect_activate(move |a, _| {
+        let on = !a.state().and_then(|v| v.get::<bool>()).unwrap_or(false);
+        a.set_state(&on.to_variant());
+        let mut s = c.st.borrow_mut();
+        s.settings.palette_lock = on;
+        s.settings.save();
+    });
+    app.add_action(&a);
     let a = gio::SimpleAction::new("open-path", Some(glib::VariantTy::STRING));
     let c = ctx.clone();
     a.connect_activate(move |_, v| {
@@ -417,6 +542,9 @@ pub fn actions(app: &adw::Application, ctx: &Rc<AppCtx>) {
     let a = gio::SimpleAction::new("plugin", Some(glib::VariantTy::STRING));
     let c = ctx.clone();
     a.connect_activate(move |_, v| {
+        if c.st.borrow().cape_doc {
+            return c.toast(t("skin_only"));
+        }
         if let Some(p) = v.and_then(|v| v.get::<String>()) {
             run_plugin(&c, &p);
         }
@@ -439,6 +567,8 @@ struct Saved {
     id: u64,
     slim: bool,
     file: Option<PathBuf>,
+    #[serde(default)]
+    cape: bool,
 }
 
 fn rec_dir() -> PathBuf {
@@ -458,9 +588,9 @@ pub fn autosave(ctx: &AppCtx) {
         return eprintln!("skinvas: autosave: {e}");
     }
     let mut list = vec![];
-    for (id, img, slim, file) in docs {
+    for (id, img, slim, file, cape) in docs {
         if img.save_with_format(dir.join(format!("{id}.png")), image::ImageFormat::Png).is_ok() {
-            list.push(Saved { id, slim, file: file.cloned() });
+            list.push(Saved { id, slim, file: file.cloned(), cape });
         }
     }
     let tmp = dir.join("index.json.tmp");
@@ -495,11 +625,14 @@ pub fn offer_recovery(ctx: &Rc<AppCtx>) {
     d.connect_response(None, move |_, r| {
         if r == "restore" {
             for e in &list {
-                if let Some(img) = std::fs::read(old.join(format!("{}.png", e.id))).ok().and_then(|b| skin::load(&b).ok()) {
-                    let mut s = c.st.borrow_mut();
-                    s.open_doc(img, e.slim, e.file.clone(), false);
-                    s.mark_dirty();
+                let Ok(b) = std::fs::read(old.join(format!("{}.png", e.id))) else { continue };
+                let mut s = c.st.borrow_mut();
+                match if e.cape { skin::load_cape(&b) } else { skin::load(&b) } {
+                    Ok(img) if e.cape => s.open_cape(img, e.file.clone()),
+                    Ok(img) => s.open_doc(img, e.slim, e.file.clone(), false),
+                    Err(_) => continue,
                 }
+                s.mark_dirty();
             }
         }
         let _ = std::fs::remove_dir_all(&old);
